@@ -29,6 +29,7 @@ data STGState =
     _curClosure :: Closure,
     _argstack :: [Closure],
     _callstack :: [Map Name Closure],
+    -- v-- this kinda mixes "compile-time" and "runtime" logic but whatever
     _nameSupply :: [Name]
   }
 
@@ -76,7 +77,8 @@ result a = a <$ popFail err callstack
   where err = ["tried to return with empty callstack"]
 
 call :: Lam Ix -> STGProgram
-call l = callstack %= (M.empty:) >> run l
+call l = callstack %= dup >> run l
+  where dup [] = []; dup (f:fs) = f:f:fs
 
 run :: Lam Ix -> STGProgram
 run (Var v) = do
@@ -85,6 +87,8 @@ run (Var v) = do
   callstack._head .= M.empty
   _enter clos
 run (Abs b) = do
+  -- TODO since we're gonna be doing nested scopes anyway, could I get away
+  -- with just using concrete names & no special indices after all?
   name <- popFail ["?!?!"] nameSupply
   let b' = instantiate1 (Var (Local name)) b
       err = ["tried to apply function with no args"]
