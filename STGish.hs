@@ -21,13 +21,17 @@ data Closure =
 data STGState =
   STGState {
     _curClosure :: Closure,
-    _argstack :: [Either STGProgram Closure],
-    _callstack :: [Env],
-    _nextId :: Int
+    _argstack :: [Closure],
+    _callstack :: [Env]
   }
 
 makeLenses ''Closure
 makeLenses ''STGState
+
+pop :: ALens' s [a] -> State s (Maybe a)
+pop l = zoom (cloneLens l) (state doPop)
+  where doPop [] = (Nothing, [])
+        doPop (a:as) = (Just a, as)
 
 env :: State STGState Env
 env = liftA2 (++) (use (singular (callstack._head)))
@@ -41,8 +45,7 @@ run (Var i) = do
   callstack._head .= []
   _enter clos
 run (Abs b) = do
-  Just arg <- preuse (argstack._head._Right)
-  argstack %= tail
+  Just arg <- pop argstack
   callstack._head %= (arg:)
   -- ...maybe I should just be using numerical de Bruijn indices
   -- instead of Bound. or even taking the approach I took last time
@@ -50,7 +53,7 @@ run (Abs b) = do
   run (instantiate1 (Var 0) (fmap succ b))
 run (App f x) = do
   thunk <- Closure (run x) <$> env
-  argstack %= (Right thunk:)
+  argstack %= (thunk:)
   run f
 run (Lit i) = callstack %= tail >> return (i, [])
 run (Op o x y) = do
@@ -74,7 +77,7 @@ run (Case x cs) = do
   let branches = map (\(Clause n b) -> (hashCode n, run b)) cs
   callstack %= ([]:)
   (ctor, fs) <- run x
-  argstack %= (map Right fs ++)
+  argstack %= (fs ++)
   let Just (_, b) = find ((==ctor) . fst) branches
   b
 

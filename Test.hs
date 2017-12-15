@@ -9,6 +9,6 @@ main = do
   code <- getLine
   let Right l = parseLam code
       Just l' = closed l
-      startState = STGState (Closure (return (0, [])) []) [] [[]] 0
+      startState = STGState (Closure (return (0, [])) []) [] [[]]
   print . fst $ evalState (run l') startState
 
