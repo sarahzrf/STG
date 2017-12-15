@@ -4,12 +4,14 @@ module STGish where
 import Bound
 import Control.Applicative
 import Control.Lens
+import Control.Monad.Except
 import Control.Monad.State
 import Data.List
 import Data.Monoid
 import Lam
 
-type STGProgram = State STGState (Int, [Closure])
+type STG = StateT STGState (Except [String])
+type STGProgram = STG (Int, [Closure])
 type Env = [Closure]
 
 data Closure =
@@ -28,24 +30,35 @@ data STGState =
 makeLenses ''Closure
 makeLenses ''STGState
 
-pop :: ALens' s [a] -> State s (Maybe a)
+liftMay :: MonadError e m => e -> Maybe a -> m a
+liftMay e Nothing = throwError e
+liftMay e (Just a) = return a
+
+pop :: Monad m => ALens' s [a] -> StateT s m (Maybe a)
 pop l = zoom (cloneLens l) (state doPop)
   where doPop [] = (Nothing, [])
         doPop (a:as) = (Just a, as)
 
-env :: State STGState Env
-env = liftA2 (++) (use (singular (callstack._head)))
-                  (use (curClosure.fields))
+popFail :: MonadError e m => e -> ALens' s [a] -> StateT s m a
+popFail e l = pop l >>= liftMay e
+
+env :: STG Env
+env = use (callstack._head <> curClosure.fields)
+
+result :: a -> STG a
+result a = a <$ popFail err callstack
+  where err = ["tried to return with empty callstack"]
 
 run :: Lam Int -> STGProgram
 run (Var i) = do
-  env <- env
-  let clos = env !! i
+  let err = ["nonexistent variable " ++ show i]
+  clos <- env >>= liftMay err . preview (ix i)
   curClosure .= clos
   callstack._head .= []
   _enter clos
 run (Abs b) = do
-  Just arg <- pop argstack
+  let err = ["tried to apply function with no args"]
+  arg <- popFail err argstack
   callstack._head %= (arg:)
   -- ...maybe I should just be using numerical de Bruijn indices
   -- instead of Bound. or even taking the approach I took last time
@@ -55,7 +68,7 @@ run (App f x) = do
   thunk <- Closure (run x) <$> env
   argstack %= (thunk:)
   run f
-run (Lit i) = callstack %= tail >> return (i, [])
+run (Lit i) = result (i, [])
 run (Op o x y) = do
   callstack %= ([]:)
   (xv, _) <- run x
@@ -66,18 +79,17 @@ run (Op o x y) = do
         Sub -> xv - yv
         Eq  -> hashCode (Name (show (xv == yv)))
         Leq -> hashCode (Name (show (xv <= yv)))
-  callstack %= tail
-  return (val, [])
+  result (val, [])
 run (Ctor name fs) = do
   env <- env
   let thunks = map (flip Closure env . run) fs
-  callstack %= tail
-  return (hashCode name, thunks)
+  result (hashCode name, thunks)
 run (Case x cs) = do
   let branches = map (\(Clause n b) -> (hashCode n, run b)) cs
   callstack %= ([]:)
   (ctor, fs) <- run x
   argstack %= (fs ++)
-  let Just (_, b) = find ((==ctor) . fst) branches
+  let err = ["no branch matching " ++ show ctor]
+  (_, b) <- liftMay err $ find ((==ctor) . fst) branches
   b
 
