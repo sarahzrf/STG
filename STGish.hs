@@ -61,17 +61,17 @@ run (Op o x y) = do
   let val = case o of
         Add -> xv + yv
         Sub -> xv - yv
-        Eq  -> idFor (show (xv == yv))
-        Leq -> idFor (show (xv <= yv))
+        Eq  -> hashCode (Name (show (xv == yv)))
+        Leq -> hashCode (Name (show (xv <= yv)))
   callstack %= tail
   return (val, [])
 run (Ctor name fs) = do
   env <- env
   let thunks = map (flip Closure env . run) fs
   callstack %= tail
-  return (idFor name, thunks)
+  return (hashCode name, thunks)
 run (Case x cs) = do
-  let branches = map (\(Clause (Name n) b) -> (idFor n, run b)) cs
+  let branches = map (\(Clause n b) -> (hashCode n, run b)) cs
   callstack %= ([]:)
   (ctor, fs) <- run x
   argstack %= (map Right fs ++)

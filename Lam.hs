@@ -12,13 +12,13 @@ import Language.Haskell.Exts.Extension
 import qualified Language.Haskell.Exts.Syntax as X
 import Text.Show.Deriving
 
-newtype Name = Name {getName :: String} deriving (Eq, Show)
+newtype Name = Name {getName :: String} deriving (Eq, Show, Ord)
 
 -- really simple hash function; borrowed from Java's String.hashCode
 -- probably designed for bytes & not codepoints; could possibly act
 -- weirdly if you put non-ASCII characters in your names
-idFor :: String -> Int
-idFor s = sum (zipWith e s [1..])
+hashCode :: Name -> Int
+hashCode (Name s) = sum (zipWith e s [1..])
   where e c i = fromEnum c * 31^(length s - i)
 
 data AOp = Add | Sub | Eq | Leq deriving Show
@@ -51,7 +51,7 @@ makeBound ''Lam
 pattern App f x = LamF (AppF f x)
 pattern Lit i = LamF (LitF i)
 pattern Op o x y = LamF (OpF o x y)
-pattern Ctor name fs = LamF (CtorF (Name name) fs)
+pattern Ctor name fs = LamF (CtorF name fs)
 pattern Case x cs = LamF (CaseF x cs)
 
 abs_ :: String -> Lam Name -> Lam Name
@@ -63,7 +63,7 @@ aOp o x y = case o of
   Sub -> Lit (x - y)
   Eq  -> reflect (x == y)
   Leq -> reflect (x <= y)
-  where reflect b = Ctor (show b)  []
+  where reflect b = Ctor (Name (show b)) []
 
 simplify :: Lam a -> Lam a
 simplify l = case l of
@@ -75,7 +75,7 @@ simplify l = case l of
   Op o x y -> Op o (simplify x) y
 
   Case (Ctor name fs) cs
-    | Just (Clause _ b) <- find (\(Clause (Name n) _) -> name == n) cs ->
+    | Just (Clause _ b) <- find (\(Clause n _) -> n == name) cs ->
       foldr (flip App) b fs
   Case x cs -> Case (simplify x) cs
 
@@ -95,7 +95,7 @@ hs2lam exp = case exp of
   X.InfixApp p l (X.QVarOp p' qn@(X.UnQual _ (X.Ident _ _))) r ->
     hs2lam (X.App p (X.App p (X.Var p' qn) l) r)
   X.App _ (X.Con _ (X.UnQual _ (X.Ident _ name))) (X.List _ as) ->
-    Ctor name <$> traverse hs2lam as
+    Ctor (Name name) <$> traverse hs2lam as
   X.App _ f x -> liftA2 App (hs2lam f) (hs2lam x)
   X.NegApp _ (X.Lit _ (X.Int _ n _)) -> Right (Lit (-fromIntegral n))
   X.Lambda _ [] b -> hs2lam b
