@@ -7,28 +7,39 @@ import Control.Lens
 import Control.Monad.Except
 import Control.Monad.State
 import Data.List
+import Data.Map (Map)
+import qualified Data.Map as M
 import Data.Monoid
 import Lam
 
 type STG = StateT STGState (Except [String])
 type STGProgram = STG (Int, [Closure])
-type Env = [Closure]
 
 data Closure =
   Closure {
     _enter :: STGProgram,
-    _fields :: Env
+    _fields :: [Closure]
   }
+
+instance Show Closure where
+  show (Closure _ vs) = "Closure _ " ++ show vs
 
 data STGState =
   STGState {
     _curClosure :: Closure,
     _argstack :: [Closure],
-    _callstack :: [Env]
+    _callstack :: [Map Name Closure],
+    _nameSupply :: [Name]
   }
 
 makeLenses ''Closure
 makeLenses ''STGState
+
+startState :: STGState
+startState = STGState emptyClos [] [M.empty] nameSupply0
+  where emptyClos = Closure (return (0, [])) []
+        nameSupply0 = fmap Name $ [1..] >>= flip replicateM alpha
+        alpha = ['a'..'z']
 
 liftMay :: MonadError e m => e -> Maybe a -> m a
 liftMay e Nothing = throwError e
@@ -42,38 +53,52 @@ pop l = zoom (cloneLens l) (state doPop)
 popFail :: MonadError e m => e -> ALens' s [a] -> StateT s m a
 popFail e l = pop l >>= liftMay e
 
-env :: STG Env
-env = use (callstack._head <> curClosure.fields)
+data Ix = Local Name | Closed Int deriving (Show, Eq, Ord)
+
+resolve :: Ix -> STG Closure
+resolve v = preuse l >>= liftMay err
+  where l = case v of
+          Local name -> callstack._head.ix name
+          Closed i -> curClosure.fields.ix i
+        err = ["nonexistent variable " ++ show v]
+
+closure :: Lam Ix -> STG Closure
+closure l = do
+  let (l', free) = runState (traverse (state . replace) l) []
+      replace v seen = case findIndex (==v) seen of
+        Nothing -> (Closed (length seen), seen ++ [v])
+        Just i  -> (Closed i, seen)
+  vs <- traverse resolve free
+  return (Closure (run l') vs)
 
 result :: a -> STG a
 result a = a <$ popFail err callstack
   where err = ["tried to return with empty callstack"]
 
-run :: Lam Int -> STGProgram
-run (Var i) = do
-  let err = ["nonexistent variable " ++ show i]
-  clos <- env >>= liftMay err . preview (ix i)
+call :: Lam Ix -> STGProgram
+call l = callstack %= (M.empty:) >> run l
+
+run :: Lam Ix -> STGProgram
+run (Var v) = do
+  clos <- resolve v
   curClosure .= clos
-  callstack._head .= []
+  callstack._head .= M.empty
   _enter clos
 run (Abs b) = do
-  let err = ["tried to apply function with no args"]
+  name <- popFail ["?!?!"] nameSupply
+  let b' = instantiate1 (Var (Local name)) b
+      err = ["tried to apply function with no args"]
   arg <- popFail err argstack
-  callstack._head %= (arg:)
-  -- ...maybe I should just be using numerical de Bruijn indices
-  -- instead of Bound. or even taking the approach I took last time
-  -- of literally carrying around names.
-  run (instantiate1 (Var 0) (fmap succ b))
+  callstack._head.at name .= Just arg
+  run b'
 run (App f x) = do
-  thunk <- Closure (run x) <$> env
-  argstack %= (thunk:)
+  arg <- closure x
+  argstack %= (arg:)
   run f
 run (Lit i) = result (i, [])
 run (Op o x y) = do
-  callstack %= ([]:)
-  (xv, _) <- run x
-  callstack %= ([]:)
-  (yv, _) <- run y
+  (xv, _) <- call x
+  (yv, _) <- call y
   let val = case o of
         Add -> xv + yv
         Sub -> xv - yv
@@ -81,14 +106,12 @@ run (Op o x y) = do
         Leq -> hashCode (Name (show (xv <= yv)))
   result (val, [])
 run (Ctor name fs) = do
-  env <- env
-  let thunks = map (flip Closure env . run) fs
+  thunks <- traverse closure fs
   result (hashCode name, thunks)
 run (Case x cs) = do
   let branches = map (\(Clause n b) -> (hashCode n, run b)) cs
-  callstack %= ([]:)
-  (ctor, fs) <- run x
-  argstack %= (fs ++)
+  (ctor, vs) <- call x
+  argstack %= (vs ++)
   let err = ["no branch matching " ++ show ctor]
   (_, b) <- liftMay err $ find ((==ctor) . fst) branches
   b
