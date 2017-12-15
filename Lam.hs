@@ -17,8 +17,8 @@ newtype Name = Name {getName :: String} deriving (Eq, Show)
 -- really simple hash function; borrowed from Java's String.hashCode
 -- probably designed for bytes & not codepoints; could possibly act
 -- weirdly if you put non-ASCII characters in your names
-idFor :: Name -> Int
-idFor (Name s) = sum (zipWith e s [1..])
+idFor :: String -> Int
+idFor s = sum (zipWith e s [1..])
   where e c i = fromEnum c * 31^(length s - i)
 
 data AOp = Add | Sub | Eq | Leq deriving Show
@@ -46,6 +46,7 @@ data Lam a =
   deriving (Functor, Foldable, Traversable)
 deriveShow1 ''Lam
 deriveShow ''Lam
+makeBound ''Lam
 
 pattern App f x = LamF (AppF f x)
 pattern Lit i = LamF (LitF i)
@@ -53,27 +54,23 @@ pattern Op o x y = LamF (OpF o x y)
 pattern Ctor name fs = LamF (CtorF (Name name) fs)
 pattern Case x cs = LamF (CaseF x cs)
 
-instance Applicative Lam where pure = Var; (<*>) = ap
-instance Monad Lam where
-  return = Var
-  Var a  >>= f = f a
-  Abs b  >>= f = Abs (b >>>= f)
-  LamF l >>= f = LamF (fmap (>>= f) l)
-
 abs_ :: String -> Lam Name -> Lam Name
 abs_ name b = Abs (abstract1 (Name name) b)
+
+aOp :: AOp -> Int -> Int -> Lam a
+aOp o x y = case o of
+  Add -> Lit (x + y)
+  Sub -> Lit (x - y)
+  Eq  -> reflect (x == y)
+  Leq -> reflect (x <= y)
+  where reflect b = Ctor (show b)  []
 
 simplify :: Lam a -> Lam a
 simplify l = case l of
   App (Abs b) x -> instantiate1 x b
   App f x -> App (simplify f) x
 
-  Op o (Lit x) (Lit y) -> case o of
-    Add -> Lit (x + y)
-    Sub -> Lit (x - y)
-    Eq  -> reflect (x == y)
-    Leq -> reflect (x <= y)
-    where reflect b = Ctor (show b)  []
+  Op o (Lit x) (Lit y) -> aOp o x y
   Op o x@(Lit _) y -> Op o x (simplify y)
   Op o x y -> Op o (simplify x) y
 
