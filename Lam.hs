@@ -65,21 +65,36 @@ aOp o x y = case o of
   Leq -> reflect (x <= y)
   where reflect b = Ctor (Name (show b)) []
 
-simplify :: Lam a -> Lam a
-simplify l = case l of
-  App (Abs b) x -> instantiate1 x b
-  App f x -> App (simplify f) x
+data Stuckness = WHNF | Stuck deriving (Show, Eq, Ord)
 
-  Op o (Lit x) (Lit y) -> aOp o x y
-  Op o x@(Lit _) y -> Op o x (simplify y)
-  Op o x y -> Op o (simplify x) y
+simplify :: Lam a -> Either Stuckness (Lam a)
+simplify (Abs _) = Left WHNF
+simplify (Lit _) = Left WHNF
+simplify (Ctor _ _) = Left WHNF
+simplify l = maybe (Left Stuck) Right (simplify' l)
+
+simplify' :: Lam a -> Maybe (Lam a)
+simplify' l = case l of
+  App (Abs b) x -> Just (instantiate1 x b)
+  App f x -> App <$> simplify' f <&> x
+
+  Op o (Lit x) (Lit y) -> pure (aOp o x y)
+  Op o x y -> Op o <$> simplify' x <&> y <|>
+              Op o x <$> simplify' y
 
   Case (Ctor name fs) cs
     | Just (Clause _ b) <- find (\(Clause n _) -> n == name) cs ->
-      foldr (flip App) b fs
-  Case x cs -> Case (simplify x) cs
+      Just (foldr (flip App) b fs)
+  Case x cs -> Case <$> simplify' x <&> cs
 
-  _ -> l
+  _ -> Nothing
+  where infixl 4 <&>
+        f <&> x = fmap ($ x) f
+
+reduce :: Lam a -> (Stuckness, Lam a)
+reduce l = case simplify l of
+  Right l' -> reduce l'
+  Left s -> (s, l)
 
 pattern XVar v <- X.PVar _ (X.Ident _ v)
 pattern XUG  e <- X.UnGuardedRhs _ e
