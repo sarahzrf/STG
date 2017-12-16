@@ -83,6 +83,7 @@ call l = callstack %= dup >> run l
 run :: Lam Ix -> STGProgram
 run (Var v) = do
   clos <- resolve v
+  -- this needs to be reset on return
   curClosure .= clos
   callstack._head .= M.empty
   _enter clos
