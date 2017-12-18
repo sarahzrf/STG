@@ -60,11 +60,8 @@ deriving instance Show Stmt
 
 type STGProgram = [Stmt]
 
-mangle :: Name -> Name
-mangle (Name s) = Name ("_stg_var_" ++ s)
-
 resolve :: Ix -> STGExpr Closure
-resolve (Local name) = STGVar (mangle name)
+resolve (Local name) = STGVar name
 resolve (Closed i) = Deref (Field i CurClosure)
 
 -- pushes to argstack
@@ -82,7 +79,7 @@ closure l =
      zipWith setField free [0..]
 
 popLoc :: Name -> Stmt
-popLoc name = Assign (LVar (mangle name)) PopArg
+popLoc name = Assign (LVar name) PopArg
 
 compile :: Lam Ix -> STGProgram
 compile (Var v) = [Jump (resolve v) (Deref (Enter (resolve v)))]
@@ -93,7 +90,6 @@ compile (Lit i) = [Return (STGLit i)]
 compile (Op o x y) =
   let xp = ProcSrc (compile x)
       yp = ProcSrc (compile y)
-      -- TODO hashCode for True and False are not 1 and 0
       e = STGOp o (CallProc xp) (CallProc yp)
   in [Return e]
 compile (Ctor name fs) =
