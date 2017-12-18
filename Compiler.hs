@@ -20,9 +20,7 @@ data STGExpr t where
   STGLit :: Int -> STGExpr 'Int
   STGOp :: AOp -> STGExpr 'Int -> STGExpr 'Int -> STGExpr 'Int
 
-  -- this is a double pointer, since a Closure is already a pointer
-  CurClosure :: STGExpr (Ptr Closure)
-  Res :: STGExpr (Ptr 'Int)
+  CurClosure :: STGExpr Closure
   PopArg :: STGExpr Closure
   PeekArg :: Int -> STGExpr Closure
   Alloc :: Int -> STGExpr Closure
@@ -30,10 +28,12 @@ data STGExpr t where
   Field :: Int -> STGExpr Closure -> STGExpr (Ptr Closure)
 
   ProcSrc :: STGProgram -> STGExpr Proc
-  -- this results in the ctor id or int value; for a ctor, the fields will be
-  -- pushed onto the argstack, suitably for immediately popping into locals
+  -- This results in the ctor id or int value; for a ctor, the fields will be
+  -- pushed onto the argstack, suitable for immediately popping into locals.
   -- The proc being called starts in a subscope (all of the variables in the
-  -- scope of the call are still accessible)
+  -- scope of the call are still accessible). After the call is done,
+  -- CurClosure should be restored to the same as before the call if there were
+  -- any jumps in the meantime.
   CallProc :: STGExpr Proc -> STGExpr 'Int
 
   TakeRef :: STGExpr t -> STGExpr (Ptr t)
@@ -41,7 +41,7 @@ data STGExpr t where
 deriving instance Show (STGExpr t)
 
 data LValue t where
-  LVar :: Name -> LValue t
+  LVar :: Name -> LValue Closure
   LPtr :: STGExpr (Ptr t) -> LValue t
 deriving instance Show (LValue t)
 
@@ -52,16 +52,20 @@ deriving instance Show (LValue t)
 data Stmt where
   Assign :: LValue t -> STGExpr t -> Stmt
   PushArg :: STGExpr Closure -> Stmt
-  Jump :: STGExpr Proc -> Stmt
+  -- first arg is what the CurClosure should be after jumping
+  Jump :: STGExpr Closure -> STGExpr Proc -> Stmt
   Return :: STGExpr 'Int -> Stmt
   Switch :: STGExpr 'Int -> [(Int, STGProgram)] -> Stmt
 deriving instance Show Stmt
 
 type STGProgram = [Stmt]
 
+mangle :: Name -> Name
+mangle (Name s) = Name ("_stg_var_" ++ s)
+
 resolve :: Ix -> STGExpr Closure
-resolve (Local name) = STGVar name
-resolve (Closed i) = Deref (Field i (Deref CurClosure))
+resolve (Local name) = STGVar (mangle name)
+resolve (Closed i) = Deref (Field i CurClosure)
 
 -- pushes to argstack
 -- TODO make this special-case; e.g., closures for variables can just reuse the
@@ -78,14 +82,10 @@ closure l =
      zipWith setField free [0..]
 
 popLoc :: Name -> Stmt
-popLoc name = Assign (LVar name) PopArg
+popLoc name = Assign (LVar (mangle name)) PopArg
 
 compile :: Lam Ix -> STGProgram
-compile (Var v) = [
-    -- this needs to be reset on return
-    Assign (LPtr CurClosure) (resolve v),
-    Jump (Deref (Enter (Deref CurClosure)))
-  ]
+compile (Var v) = [Jump (resolve v) (Deref (Enter (resolve v)))]
 compile (Abs name b) = popLoc name : compile b'
   where b' = instantiate1 (Var (Local name)) b
 compile (App f x) = closure x ++ compile f

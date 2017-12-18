@@ -77,13 +77,15 @@ result a = a <$ popFail err callstack
   where err = ["tried to return with empty callstack"]
 
 call :: Lam Ix -> STGProgram
-call l = callstack %= dup >> run l
-  where dup [] = []; dup (f:fs) = f:f:fs
+call l = do
+  let dup [] = []; dup (f:fs) = f:f:fs
+  callstack %= dup
+  clos <- use curClosure
+  run l <* (curClosure .= clos)
 
 run :: Lam Ix -> STGProgram
 run (Var v) = do
   clos <- resolve v
-  -- this needs to be reset on return
   curClosure .= clos
   callstack._head .= M.empty
   _enter clos
