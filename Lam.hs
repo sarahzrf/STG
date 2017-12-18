@@ -6,7 +6,8 @@ module Lam where
 import Bound
 import Control.Applicative
 import Control.Monad
-import Data.Foldable
+import Control.Monad.Trans
+import Data.List
 import Language.Haskell.Exts.Parser
 import Language.Haskell.Exts.Extension
 import qualified Language.Haskell.Exts.Syntax as X
@@ -22,40 +23,47 @@ hashCode (Name s) = sum (zipWith e s [1..])
   where e c i = fromEnum c * 31^(length s - i)
 
 data AOp = Add | Sub | Eq | Leq deriving Show
-data LamF r =
-    AppF r r
-  | LitF Int
-  | OpF AOp r r
-  | CtorF Name [r]
-  | CaseF r [Clause r]
-  deriving (Show, Functor, Foldable, Traversable)
-
--- in order for this to work w/ the binding-in-recursive-type approach,
--- we'll have to put terms in branches that get applied to the fields,
--- rather than having patterns with bindings
-data Clause r = Clause Name r
-  deriving (Show, Functor, Foldable, Traversable)
-
-deriveShow1 ''LamF
-deriveShow1 ''Clause
-
 data Lam a =
     Var a
-  | Abs (Scope () Lam a)
-  | LamF (LamF (Lam a))
+  -- Keeping around the name of the bound variable will be useful.
+  -- We'll never do freshening, though; we don't care about names in the simple
+  -- interpreter below, so it doesn't matter, and in the STG stuff, we either
+  -- use nested scopes or replace free names with closure indices.
+  -- We could just abandon the Bound stuff entirely and work with plain
+  -- concrete terms, but we'd end up having to implement a lot of the same
+  -- machinery in order to, e.g., traverse free variables.
+  | Abs Name (Scope () Lam a)
+  | App (Lam a) (Lam a)
+  | Lit Int
+  | Op AOp (Lam a) (Lam a)
+  | Ctor Name [Lam a]
+  | Case (Lam a) [Clause a]
   deriving (Functor, Foldable, Traversable)
-deriveShow1 ''Lam
-deriveShow ''Lam
-makeBound ''Lam
 
-pattern App f x = LamF (AppF f x)
-pattern Lit i = LamF (LitF i)
-pattern Op o x y = LamF (OpF o x y)
-pattern Ctor name fs = LamF (CtorF name fs)
-pattern Case x cs = LamF (CaseF x cs)
+-- the length of the list should _always_ be > every bound Int
+data Clause a = Clause Name [Name] (Scope Int Lam a)
+  deriving (Functor, Foldable, Traversable)
+
+deriveShow1 ''Lam
+deriveShow1 ''Clause
+deriveShow ''Lam
+deriveShow ''Clause
+
+instance Applicative Lam where pure = return; (<*>) = ap
+instance Monad Lam where
+  return = Var
+  l >>= k = case l of
+    Var v -> k v
+    Abs name b -> Abs name (b >>>= k)
+    App f x -> App (f >>= k) (x >>= k)
+    Lit i -> Lit i
+    Op op x y -> Op op (x >>= k) (y >>= k)
+    Ctor name fs -> Ctor name (map (>>= k) fs)
+    Case x cs -> Case (x >>= k) (map clause cs)
+    where clause (Clause name names b) = Clause name names (b >>>= k)
 
 abs_ :: String -> Lam Name -> Lam Name
-abs_ name b = Abs (abstract1 (Name name) b)
+abs_ name b = Abs (Name name) (abstract1 (Name name) b)
 
 aOp :: AOp -> Int -> Int -> Lam a
 aOp o x y = case o of
@@ -68,14 +76,14 @@ aOp o x y = case o of
 data Stuckness = WHNF | Stuck deriving (Show, Eq, Ord)
 
 simplify :: Lam a -> Either Stuckness (Lam a)
-simplify (Abs _) = Left WHNF
+simplify (Abs _ _) = Left WHNF
 simplify (Lit _) = Left WHNF
 simplify (Ctor _ _) = Left WHNF
 simplify l = maybe (Left Stuck) Right (simplify' l)
 
 simplify' :: Lam a -> Maybe (Lam a)
 simplify' l = case l of
-  App (Abs b) x -> Just (instantiate1 x b)
+  App (Abs _ b) x -> Just (instantiate1 x b)
   App f x -> App <$> simplify' f <&> x
 
   Op o (Lit x) (Lit y) -> pure (aOp o x y)
@@ -83,8 +91,9 @@ simplify' l = case l of
               Op o x <$> simplify' y
 
   Case (Ctor name fs) cs
-    | Just (Clause _ b) <- find (\(Clause n _) -> n == name) cs ->
-      Just (foldr (flip App) b fs)
+    | Just (Clause _ names b) <- find (\(Clause n _ _) -> n == name) cs,
+      length names == length fs ->
+      Just (instantiate (fs !!) b)
   Case x cs -> Case <$> simplify' x <&> cs
 
   _ -> Nothing
@@ -117,8 +126,8 @@ hs2lam exp = case exp of
   X.Lambda p (XVar v:as) b ->
     abs_ v <$> hs2lam (X.Lambda p as b)
   X.If _ c t e -> liftA2 Case (hs2lam c)
-    (sequence [Clause (Name "True")  <$> hs2lam e,
-               Clause (Name "False") <$> hs2lam t])
+    (sequence [Clause (Name "True")  [] . lift <$> hs2lam e,
+               Clause (Name "False") [] . lift <$> hs2lam t])
   X.Case _ s as -> liftA2 Case (hs2lam s) (traverse clause as)
   X.Paren _ e -> hs2lam e
   X.LCase _ as -> abs_ "!" . Case (Var (Name "!")) <$> traverse clause as
@@ -135,9 +144,10 @@ hs2lam exp = case exp of
                 (X.PApp _ (X.UnQual _ (X.Ident _ name)) ps)
                 (XUG b) Nothing)
           | Just fs <- traverse pvar ps =
-            (\b -> Clause (Name name) (foldr abs_ b fs)) <$> hs2lam b
+            let ixOf n = findIndex (==n) fs
+            in Clause (Name name) fs . abstract ixOf <$> hs2lam b
         clause c = Left ("unsupported clause type: " ++ show c)
-        pvar (X.PVar _ (X.Ident _ v)) = Just v
+        pvar (X.PVar _ (X.Ident _ v)) = Just (Name v)
         pvar _ = Nothing
 
 parseLam :: String -> Either String (Lam Name)

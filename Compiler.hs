@@ -3,11 +3,11 @@
 module Compiler where
 
 import Bound
+import Bound.Scope
 import Control.Applicative
 import Control.Monad.State
 import Data.List
 import Lam
-import Numeric
 
 -- 'Closure' is actually a pointer to a closure
 data STGType = Int | Closure | Proc | Ptr STGType deriving (Show)
@@ -24,14 +24,14 @@ data STGExpr t where
   CurClosure :: STGExpr (Ptr Closure)
   Res :: STGExpr (Ptr 'Int)
   PopArg :: STGExpr Closure
+  PeekArg :: Int -> STGExpr Closure
   Alloc :: Int -> STGExpr Closure
   Enter :: STGExpr Closure -> STGExpr (Ptr Proc)
   Field :: Int -> STGExpr Closure -> STGExpr (Ptr Closure)
 
   ProcSrc :: STGProgram -> STGExpr Proc
   -- this results in the ctor id or int value; for a ctor, the fields will be
-  -- pushed onto the argstack, suitably for immediately jumping to the matching
-  -- branch
+  -- pushed onto the argstack, suitably for immediately popping into locals
   -- The proc being called starts in a subscope (all of the variables in the
   -- scope of the call are still accessible)
   CallProc :: STGExpr Proc -> STGExpr 'Int
@@ -54,7 +54,7 @@ data Stmt where
   PushArg :: STGExpr Closure -> Stmt
   Jump :: STGExpr Proc -> Stmt
   Return :: STGExpr 'Int -> Stmt
-  If :: STGExpr 'Int -> STGProgram -> Stmt
+  Switch :: STGExpr 'Int -> [(Int, STGProgram)] -> Stmt
 deriving instance Show Stmt
 
 type STGProgram = [Stmt]
@@ -63,55 +63,47 @@ resolve :: Ix -> STGExpr Closure
 resolve (Local name) = STGVar name
 resolve (Closed i) = Deref (Field i (Deref CurClosure))
 
--- TODO unify this with the other nameSupply0
-nextName :: State Int Name
-nextName = do
-  i <- state (\i -> (i, i + 1))
-  return (Name (showIntAtBase 26 (toEnum . (+ fromEnum 'a')) i ""))
-
 -- pushes to argstack
 -- TODO make this special-case; e.g., closures for variables can just reuse the
 -- existing closure
-closure :: Lam Ix -> State Int STGProgram
-closure l = do
-  c <- nextName
+closure :: Lam Ix -> STGProgram
+closure l =
   let (l', free) = runState (traverse (state . replace) l) []
       replace v seen = case findIndex (==v) seen of
         Nothing -> (Closed (length seen), seen ++ [v])
         Just i  -> (Closed i, seen)
-      setField v i = Assign (LPtr (Field i (STGVar c))) (resolve v)
-      setFields = zipWith setField free [0..]
-  p <- compile l'
-  -- TODO this introduces a bunch of new variables which we don't really need
-  -- to keep around
-  return $ [Assign (LVar c) (Alloc (length free)),
-            Assign (LPtr (Enter (STGVar c))) (ProcSrc p)] ++
-           setFields ++ [PushArg (STGVar c)]
+      setField v i = Assign (LPtr (Field i (PeekArg 0))) (resolve v)
+  in [PushArg (Alloc (length free)),
+      Assign (LPtr (Enter (PeekArg 0))) (ProcSrc (compile l'))] ++
+     zipWith setField free [0..]
 
-compile :: Lam Ix -> State Int STGProgram
-compile (Var v) = return [
+popLoc :: Name -> Stmt
+popLoc name = Assign (LVar name) PopArg
+
+compile :: Lam Ix -> STGProgram
+compile (Var v) = [
     -- this needs to be reset on return
     Assign (LPtr CurClosure) (resolve v),
     Jump (Deref (Enter (Deref CurClosure)))
   ]
-compile (Abs b) = do
-  name <- nextName
-  let b' = instantiate1 (Var (Local name)) b
-  (Assign (LVar name) PopArg:) <$> compile b'
-compile (App f x) = liftA2 (++) (closure x) (compile f)
-compile (Lit i) = return [Return (STGLit i)]
-compile (Op o x y) = do
-  xp <- compile x
-  yp <- compile y
-  -- TODO hashCode for True and False are not 1 and 0
-  let e = STGOp o (CallProc (ProcSrc xp)) (CallProc (ProcSrc yp))
-  return [Return e]
-compile (Ctor name fs) = do
-  thunks <- traverse closure (reverse fs)
-  return (concat thunks ++ [Return (STGLit (hashCode name))])
-compile (Case x cs) = do
-  scrutinize <- compile x
-  branches <- forM cs $ \(Clause n b) -> ((,) (hashCode n)) <$> compile b
-  return $ [Assign (LPtr Res) (CallProc (ProcSrc scrutinize))] ++
-    map (\(h, b) -> If (STGOp Eq (Deref Res) (STGLit h)) b) branches
+compile (Abs name b) = popLoc name : compile b'
+  where b' = instantiate1 (Var (Local name)) b
+compile (App f x) = closure x ++ compile f
+compile (Lit i) = [Return (STGLit i)]
+compile (Op o x y) =
+  let xp = ProcSrc (compile x)
+      yp = ProcSrc (compile y)
+      -- TODO hashCode for True and False are not 1 and 0
+      e = STGOp o (CallProc xp) (CallProc yp)
+  in [Return e]
+compile (Ctor name fs) =
+  -- gotta reverse fs because since each (closure f) pushes, the stack ends up
+  -- backwards from fs
+  (reverse fs >>= closure) ++ [Return (STGLit (hashCode name))]
+compile (Case x cs) =
+  let scrutinize = ProcSrc (compile x)
+      clause (Clause name names b) =
+        (hashCode name, map popLoc names ++ compile (body names b))
+      body names b = instantiateVars (map Local names) b
+  in [Switch (CallProc scrutinize) (map clause cs)]
 

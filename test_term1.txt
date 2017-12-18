@@ -1,0 +1,1 @@
+(\f -> f 3) (\i d -> case d of A l -> -1; B r s -> i + r) (B [4, 5])

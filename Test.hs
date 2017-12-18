@@ -11,6 +11,7 @@ main = do
   code <- getLine
   let Right l = parseLam code
       Just l' = closed l
+  print $! reduce l
   print $! fmap fst $ evalStateT (run l') startState
-  print $! evalState (compile l') 0
+  print $! compile l'
 
