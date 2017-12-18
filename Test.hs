@@ -3,7 +3,7 @@ module Test where
 import Bound
 import Control.Monad.State
 import Lam
-import STGish (run, startState)
+import Interpreter (run, startState)
 import Compiler (compile)
 
 main :: IO ()

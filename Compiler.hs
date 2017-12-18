@@ -45,6 +45,10 @@ data LValue t where
   LPtr :: STGExpr (Ptr t) -> LValue t
 deriving instance Show (LValue t)
 
+-- Exiting scopes and creating stack frames are actually totally
+-- separate here. We create a new stack frame when we do a force, but
+-- the expression we force is in the same lexical scope; we exit a
+-- scope when we enter a variable, but that will always be a jump.
 data Stmt where
   Assign :: LValue t -> STGExpr t -> Stmt
   PushArg :: STGExpr Closure -> Stmt

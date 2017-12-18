@@ -1,5 +1,5 @@
 {-# LANGUAGE TemplateHaskell #-}
-module STGish where
+module Interpreter where
 
 import Bound
 import Control.Applicative
@@ -11,6 +11,9 @@ import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Monoid
 import Lam
+
+-- This module is an interpreter for the Lam language, but one that simulates
+-- the behavior of the STG program for the expression it interprets.
 
 type STG = StateT STGState (Except [String])
 type STGProgram = STG (Int, [Closure])
