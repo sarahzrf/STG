@@ -13,6 +13,12 @@ import Lam
 
 -- 'Closure' is actually a pointer to a closure
 data STGType = Int | Closure | Proc | Ptr STGType deriving (Show)
+data STGTypeR t where
+  IntR :: STGTypeR 'Int
+  ClosureR :: STGTypeR Closure
+  ProcR :: STGTypeR Proc
+  PtrR :: STGTypeR t -> STGTypeR (Ptr t)
+deriving instance Show (STGTypeR t)
 
 data Ix = Local Name | Closed Int deriving (Show, Eq, Ord)
 makePrisms ''Ix
@@ -37,7 +43,7 @@ data STGExpr t where
   -- before the call if there were any jumps in the meantime.
   CallProc :: STGExpr Proc -> [Name] -> STGExpr 'Int
 
-  Deref :: STGExpr (Ptr t) -> STGExpr t
+  Load :: STGTypeR t -> STGExpr (Ptr t) -> STGExpr t
 deriving instance Show (STGExpr t)
 
 -- Exiting scopes and creating stack frames are actually totally separate here.
@@ -50,7 +56,7 @@ deriving instance Show (STGExpr t)
 -- in ProcSrc.)
 data Stmt where
   Set :: Name -> STGExpr Closure -> Stmt
-  Store :: STGExpr (Ptr t) -> STGExpr t -> Stmt
+  Store :: STGTypeR t -> STGExpr (Ptr t) -> STGExpr t -> Stmt
   PushArg :: STGExpr Closure -> Stmt
   -- first arg is what the CurClosure should be after jumping
   -- we don't need a list of names here because the free variables for anything
@@ -64,7 +70,7 @@ type STGProgram = [Stmt]
 
 resolve :: Ix -> STGExpr Closure
 resolve (Local name) = STGVar name
-resolve (Closed i) = Deref (Field i CurClosure)
+resolve (Closed i) = Load ClosureR (Field i CurClosure)
 
 -- pushes to argstack
 -- TODO make this special-case; e.g., closures for variables can just reuse the
@@ -75,9 +81,9 @@ closure l =
       replace v seen = case findIndex (==v) seen of
         Nothing -> (Closed (length seen), seen ++ [v])
         Just i  -> (Closed i, seen)
-      setField v i = Store (Field i (PeekArg 0)) (resolve v)
+      setField v i = Store ClosureR (Field i (PeekArg 0)) (resolve v)
   in [PushArg (Alloc (length free)),
-      Store (Enter (PeekArg 0)) (ProcSrc (compile l') [])] ++
+      Store ProcR (Enter (PeekArg 0)) (ProcSrc (compile l') [])] ++
      zipWith setField free [0..]
 
 popLoc :: Name -> Stmt
@@ -90,7 +96,7 @@ force l =
   in CallProc proc env
 
 compile :: Lam Ix -> STGProgram
-compile (Var v) = [Jump (resolve v) (Deref (Enter (resolve v)))]
+compile (Var v) = [Jump (resolve v) (Load ProcR (Enter (resolve v)))]
 compile (Abs name b) = popLoc name : compile b'
   where b' = instantiate1 (Var (Local name)) b
 compile (App f x) = closure x ++ compile f

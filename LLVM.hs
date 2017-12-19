@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE DataKinds, GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -11,6 +11,7 @@ import Control.Monad.Writer
 import Data.List
 import Data.Map (Map)
 import qualified Data.Map as M
+import Data.Proxy
 import Data.String
 import Lam
 import Numeric
@@ -20,6 +21,13 @@ newtype LLVMExpr = LLVMExpr {getSrc :: String}
 newtype LLVMFunc = LLVMFunc {getLines :: [String]}
   deriving (Show, Monoid)
 type LLVMModule = Map LLVMExpr LLVMFunc
+
+-- we're gonna need to statically know some STG types
+llvmTy :: STGTypeR t -> LLVMExpr
+llvmTy IntR = "i32"
+llvmTy ClosureR = "%closure*"
+llvmTy ProcR = "i32(%closure*)*"
+llvmTy (PtrR tr) = llvmTy tr <> "*"
 
 base25 :: Int -> ShowS
 base25 = showIntAtBase 25 (toEnum . (+97))
@@ -44,15 +52,9 @@ data CState =
 makeLenses ''CState
 type LLVMCompiler = State CState
 
-addLine :: LLVMExpr -> LLVMCompiler ()
+addLine, addLineB :: LLVMExpr -> LLVMCompiler ()
 addLine (LLVMExpr e) = func <>= LLVMFunc [e]
-
-save :: LLVMExpr -> LLVMCompiler LLVMExpr
-save e = do
-  next <- nextTemp <<+= 1
-  let v = LLVMExpr ('%':show next)
-  addLine $ v <> " = " <> e
-  return v
+addLineB e = addLine ("    " <> e)
 
 argsFor :: [Name] -> LLVMExpr
 argsFor names =
@@ -62,62 +64,93 @@ argsFor names =
 lit :: Int -> LLVMExpr
 lit i = LLVMExpr (show i)
 
-compileExpr :: STGExpr t -> LLVMCompiler LLVMExpr
-compileExpr e = case e of
-  STGVar name -> return (loc name)
+save :: LLVMExpr -> LLVMCompiler LLVMExpr
+save e = do
+  next <- nextTemp <<+= 1
+  let v = LLVMExpr ("%temp_" ++ show next)
+  addLineB $ v <> " = " <> e
+  return v
 
-  STGLit i -> return (lit i)
+data ExprType = Instr | Arg deriving (Show, Eq, Ord)
+type LLVMExprT = (ExprType, LLVMExpr)
+
+-- TODO this doesn't actually work if the T is an Arg. rn that's not a problem
+-- since we'll never get there from the output of the current STG compiler, but
+-- it hypothetically could be?
+asInstr, asArg :: LLVMExprT -> LLVMCompiler LLVMExpr
+asInstr = return . snd
+asArg (Arg, e) = return e
+asArg (Instr, e) = save e
+
+compileAsInstr, compileAsArg :: STGExpr t -> LLVMCompiler LLVMExpr
+compileAsInstr = compileExpr >=> asInstr
+compileAsArg = compileExpr >=> asArg
+
+compileExpr :: STGExpr t -> LLVMCompiler LLVMExprT
+compileExpr e = case e of
+  STGVar name -> return (Arg, loc name)
+
+  STGLit i -> return (Arg, lit i)
   STGOp op x y -> do
-    xe <- compileExpr x
-    ye <- compileExpr y
+    xe <- compileAsArg x
+    ye <- compileAsArg y
     let args = xe <> ", " <> ye
         [t, f] = map (lit . hashCode . Name) ["True", "False"]
         select b = "select i1 " <> b <> " i32 " <> t <> ", i32 " <> f
     case op of
-      Add -> save ("add i32 " <> args)
-      Sub -> save ("sub i32 " <> args)
-      Eq  -> do b <- save ("icmp eq " <> args); save (select b)
-      Leq -> do b <- save ("icmp sle " <> args); save (select b)
+      Add -> return (Instr, "add i32 " <> args)
+      Sub -> return (Instr, "sub i32 " <> args)
+      Eq  -> do b <- save ("icmp eq " <> args); return (Instr, select b)
+      Leq -> do b <- save ("icmp sle " <> args); return (Instr, select b)
 
-  CurClosure -> return "%cur_closure"
+  CurClosure -> return (Arg, "%cur_closure")
   -- TODO inline this stuff maybe? llvm's probably smart enough
-  PopArg -> save "call %closure* @pop_arg()"
+  PopArg -> return (Instr, "call %closure* @pop_arg()")
   PeekArg i ->
-    save $ "call %closure* @peek_arg(i32 " <> lit i <> ")"
+    return (Instr, "call %closure* @peek_arg(i32 " <> lit i <> ")")
   Alloc i ->
-    save $ "call %closure* @alloc_closure(i32 " <> lit i <> ")"
-{-
-  Enter :: STGExpr Closure -> STGExpr (Ptr Proc)
-  Field :: Int -> STGExpr Closure -> STGExpr (Ptr Closure)
--}
+    return (Instr, "call %closure* @alloc_closure(i32 " <> lit i <> ")")
+  Enter e -> do
+    e' <- compileAsArg e
+    return (Instr,
+      "getelementptr %closure, %closure* " <> e' <> ", i32 0, i32 0")
+  Field i e -> do
+    e' <- compileAsArg e
+    return (Instr, "getelementptr %closure, %closure* " <> e' <>
+           ", i32 1, i32 " <> lit i)
 
-  ProcSrc p names -> compileFunc p names
+  ProcSrc p names -> (,) Arg <$> compileFunc p names
   CallProc proc names -> do
-    proc' <- compileExpr proc
-    save $ "call i32 " <> proc' <> "(" <> argsFor names <> ")"
+    proc' <- compileAsArg proc
+    return (Instr, "call i32 " <> proc' <> "(" <> argsFor names <> ")")
 
-{-
-  Deref :: STGExpr (Ptr t) -> STGExpr t
--}
+  Load tr ptr -> do
+    ptr' <- compileAsArg ptr
+    let ty = llvmTy tr
+    return (Instr, "load " <> ty <> ", " <> ty <> "* " <> ptr')
 
 compileStmt :: Stmt -> LLVMCompiler ()
 compileStmt s = case s of
   Set name e -> do
-    e' <- compileExpr e
-    addLine $ loc name <> " = " <> e'
-{-
-  Store :: STGExpr (Ptr t) -> STGExpr t -> Stmt
--}
+    e' <- compileAsInstr e
+    addLineB $ loc name <> " = " <> e'
+  Store tr ptr e -> do
+    ptr' <- compileAsArg ptr
+    e' <- compileAsArg e
+    let ty = llvmTy tr
+    addLineB $ "store " <> ty <> " " <> e' <> ", " <> ty <> "* " <> ptr'
   PushArg e -> do
-    e' <- compileExpr e
-    addLine $ "call %closure* @push_arg(%closure* " <> e' <> ")"
+    e' <- compileAsArg e
+    addLineB $ "call %closure* @push_arg(%closure* " <> e' <> ")"
   Jump cur proc -> do
-    cur' <- compileExpr cur
-    proc' <- compileExpr proc
-    addLine $ "musttail call i32 " <> proc' <> "(%closure* " <> cur' <> ")"
+    cur' <- compileAsArg cur
+    proc' <- compileAsArg proc
+    addLineB $ "%tail = musttail call i32 " <>
+      proc' <> "(%closure* " <> cur' <> ")"
+    addLineB "ret i32 %tail"
   Return e -> do
-    e' <- compileExpr e
-    addLine $ "ret i32 " <> e'
+    e' <- compileAsArg e
+    addLineB $ "ret i32 " <> e'
 {-
   Switch :: STGExpr 'Int -> [(Int, STGProgram)] -> Stmt
 -}
@@ -151,7 +184,7 @@ serialize modu main =
         -- %closure* push_arg(%closure*)
         -- %closure* alloc_closure(i32)
         preamble = unlines [
-          "%closure = type {i32 (%closure*)*, [0 x %closure*]}"]
+          "%closure = type {i32(%closure*)*, [0 x %closure*]}"]
         mainFunc = unlines [
           "define i32 @main() {",
           -- null is fine as long as there are no free variables at the top
