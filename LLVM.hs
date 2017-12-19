@@ -104,12 +104,11 @@ compileExpr e = case e of
       Leq -> do b <- save ("icmp sle " <> args); return (Instr, select b)
 
   CurClosure -> return (Arg, "%cur_closure")
-  -- TODO inline this stuff maybe? llvm's probably smart enough
   PopArg -> return (Instr, "call %closure* @pop_arg()")
   PeekArg i ->
     return (Instr, "call %closure* @peek_arg(i32 " <> lit i <> ")")
   Alloc i ->
-    return (Instr, "call %closure* @alloc_closure(i32 " <> lit i <> ")")
+    return (Instr, "call %closure* @alloc_closure(i64 " <> lit i <> ")")
   Enter e -> do
     e' <- compileAsArg e
     return (Instr,
@@ -141,7 +140,7 @@ compileStmt s = case s of
     addLineB $ "store " <> ty <> " " <> e' <> ", " <> ty <> "* " <> ptr'
   PushArg e -> do
     e' <- compileAsArg e
-    addLineB $ "call %closure* @push_arg(%closure* " <> e' <> ")"
+    addLineB $ "call void @push_arg(%closure* " <> e' <> ")"
   Jump cur proc -> do
     cur' <- compileAsArg cur
     proc' <- compileAsArg proc
@@ -175,27 +174,59 @@ compileFunc p names = do
   modu <>= M.singleton name func'
   return name
 
+-- TODO have something smarter for the stack than static allocation
+preamble :: String
+preamble = unlines [
+  "%closure = type {i32(%closure*)*, [0 x %closure*]}",
+  "declare noalias i8* @calloc(i64, i64)",
+  "define %closure* @alloc_closure(i64 %fc) {",
+  "    %fsize = mul i64 %fc, 8",
+  "    %size = add i64 %fsize, 8",
+  "    %p = call noalias i8* @calloc(i64 1, i64 %size)",
+  "    %c = bitcast i8* %p to %closure*",
+  "    ret %closure* %c",
+  "}",
+  "@stack = global [3000 x %closure*] zeroinitializer",
+  "@top = global i32 0",
+  "define %closure* @peek_arg(i32 %offset) {",
+  "    %top = load i32, i32* @top",
+  "    %ix = sub i32 %top, %offset",
+  "    %sp = getelementptr [3000 x %closure*]," ++
+       " [3000 x %closure*]* @stack, i32 0, i32 %ix",
+  "    %arg = load %closure*, %closure** %sp",
+  "    ret %closure* %arg",
+  "}",
+  "define %closure* @pop_arg() {",
+  "    %arg = call %closure* @peek_arg(i32 0)",
+  "    %top = load i32, i32* @top",
+  "    %top_ = sub i32 %top, 1",
+  "    store i32 %top_, i32* @top",
+  "    ret %closure* %arg",
+  "}",
+  "define void @push_arg(%closure* %arg) {",
+  "    %top = load i32, i32* @top",
+  "    %top_ = add i32 %top, 1",
+  "    store i32 %top_, i32* @top",
+  "    %sp = getelementptr [3000 x %closure*]," ++
+       " [3000 x %closure*]* @stack, i32 0, i32 %top_",
+  "    store %closure* %arg, %closure** %sp",
+  "    ret void",
+  "}"]
+
 serialize :: LLVMModule -> LLVMExpr -> String
 serialize modu main =
     preamble ++ foldMap (unlines . getLines) modu ++ mainFunc
-  where -- TODO: set up the stack, define closure type, etc
-        -- %closure* pop_arg
-        -- %closure* peek_arg(i32)
-        -- %closure* push_arg(%closure*)
-        -- %closure* alloc_closure(i32)
-        preamble = unlines [
-          "%closure = type {i32(%closure*)*, [0 x %closure*]}"]
-        mainFunc = unlines [
+  where mainFunc = unlines [
           "define i32 @main() {",
           -- null is fine as long as there are no free variables at the top
           -- level, which would be an error in any case
-          "%result = call i32 " ++ getSrc main ++ "(%closure* null)",
-          "ret i32 %result",
+          "    %result = call i32 " ++ getSrc main ++ "(%closure* null)",
+          "    ret i32 %result",
           "}"]
 
 compileSTG :: STGProgram -> String
 compileSTG p =
-  let s =  CState 1 mempty 1 mempty
+  let s =  CState 0 mempty 0 mempty
       (main, CState _ _ _ modu) = runState (compileFunc p []) s
   in serialize modu main
 
