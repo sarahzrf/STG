@@ -4,6 +4,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 module LLVM where
 
+-- this is broken, but LLVM2 is a major improvement anyway
+
 import Compiler
 import Control.Lens
 import Control.Monad.State
