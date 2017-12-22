@@ -6,7 +6,6 @@ import Control.Lens
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.ByteString (ByteString)
-import Data.ByteString.Short (ShortByteString)
 import Data.Functor.Compose
 import Data.List
 import Lam
@@ -27,14 +26,18 @@ uniq s =
           Nothing -> ((!! length seen), seen ++ [v])
           Just i  -> ((!! i), seen)
 
-type FunB = IRBuilderT (ReaderT Env ModuleBuilder)
+-- looks like the place we'll need fresh names is in the monad that
+-- DOESN'T supply them...
+type ModB = StateT Int ModuleBuilder
+type FunB = IRBuilderT (ReaderT Env ModB)
 
 func ::
-  ShortByteString -> Int -> ([Operand] -> FunB (Lam Operand)) -> FunB Operand
+  String -> Int -> ([Operand] -> FunB (Lam Operand)) -> FunB Operand
 func prefix pcount h = do
   cpt <- view closPtrType
-  funName <- freshName prefix
-  let params = replicate pcount (cpt, NoParameterName)
+  freshNum <- id <<+= 1
+  let funName = mkName (prefix ++ "." ++ show freshNum)
+      params = replicate pcount (cpt, NoParameterName)
   lift $ repair <$> function funName params i32 (compile <=< h)
 
 thunk :: Lam Operand -> FunB Operand
@@ -114,7 +117,7 @@ compileMain :: Lam Operand -> ModuleBuilder ()
 compileMain l = do
   env <- preamble
   let func = function "main" [] i32 (const (compile l))
-  void (runReaderT func env)
+  void (evalStateT (runReaderT func env) 0)
 
 serialize :: Module -> IO ByteString
 serialize mod = withContext $ \ctx ->
