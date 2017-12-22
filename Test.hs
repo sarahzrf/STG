@@ -13,7 +13,7 @@ import System.Environment
 main :: IO ()
 main = do
   code <- getContents
-  let Right l = parseLam code
+  let l = either error id (parseLam code)
       Just l' = closed l
   print $! reduce l
   print $! fmap fst $ evalStateT (run l') startState

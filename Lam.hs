@@ -126,8 +126,8 @@ hs2lam exp = case exp of
   X.Lambda p (XVar v:as) b ->
     abs_ v <$> hs2lam (X.Lambda p as b)
   X.If _ c t e -> liftA2 Case (hs2lam c)
-    (sequence [Clause (Name "True")  [] . lift <$> hs2lam e,
-               Clause (Name "False") [] . lift <$> hs2lam t])
+    (sequence [Clause (Name "True")  [] . lift <$> hs2lam t,
+               Clause (Name "False") [] . lift <$> hs2lam e])
   X.Case _ s as -> liftA2 Case (hs2lam s) (traverse clause as)
   X.Paren _ e -> hs2lam e
   X.LCase _ as -> abs_ "!" . Case (Var (Name "!")) <$> traverse clause as
