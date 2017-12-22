@@ -74,7 +74,7 @@ preamble = do
     store top 0 topV'
     sp <- gep stack [lit 0, topV]
     arg <- load sp 0
-    store sp 0 (ConstantOperand (K.Undef closP))
+    store sp 0 (ConstantOperand (K.Null closP))
     ret arg
   return Env {
     _closPtrType = closP,
