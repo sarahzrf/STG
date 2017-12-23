@@ -125,8 +125,15 @@ compile p l = case l of
       emitBlockStart label
       args <- replicateM (length names) (call pop [])
       r <- compile p (instantiateVars args b)
-      () <- case p of Res -> return (); Scrut -> br resLabel
-      return (r, label)
+      -- this is kinda hacky...
+      curLabel <- case p of
+        Res -> return ""
+        Scrut -> do
+          br resLabel
+          let l IRBuilderState{builderBlock=
+            Just PartialBlock{partialBlockName=name}} = name
+          liftIRState (gets l)
+      return (r, curLabel :: AST.Name)
     emitBlockStart defaultLabel
     unreachable
     case p of Res -> return (); Scrut -> emitBlockStart resLabel >> phi phis
