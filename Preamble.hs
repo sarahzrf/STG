@@ -5,7 +5,6 @@ module Preamble where
 import Control.Lens
 import LLVM.AST hiding (function)
 import qualified LLVM.AST.Constant as K
-import qualified LLVM.AST.Global as G
 import LLVM.AST.Type
 import LLVM.IRBuilder
 
@@ -17,8 +16,7 @@ data Env =
   Env {
     _closPtrType :: Type,
     _allocClosure :: Operand,
-    _pushArg :: Operand,
-    _popArg :: Operand} deriving (Show)
+    _calloc :: Operand} deriving (Show)
 makeLenses ''Env
 
 -- this compensates for a bug in llvm-hs{,-pure}
@@ -31,55 +29,32 @@ preamble :: ModuleBuilder Env
 preamble = do
   let ctn = "closure"
       closP = ptr (NamedTypeReference ctn)
+      fty = ptr (FunctionType {
+              resultType = i32,
+              argumentTypes = [closP, ptr closP],
+              isVarArg = False})
       cty  = StructureType {
         isPacked = False,
         elementTypes = [
-          ptr (FunctionType {
-            resultType = i32,
-            argumentTypes = [closP],
-            isVarArg = False}),
+          fty,
           ArrayType {
             nArrayElements = 0,
             elementType = closP}]}
   typedef ctn (Just cty)
   calloc <- repair <$> extern "calloc" [i64, i64] (ptr i8)
   allocClosure <- fmap repair . function "alloc_closure"
-    [(i64, NoParameterName)] closP $ \[fc] -> do
-    fsize <- mul fc (lit64 8)
-    size <- add fsize (lit64 8)
-    p <- call calloc [(lit64 1, []), (size, [])]
-    c <- bitcast p closP
-    ret c
-  let stackTy = ArrayType 3000 closP
-  emitDefn $ GlobalDefinition globalVariableDefaults {
-    G.name = "stack",
-    G.type' = stackTy,
-    G.initializer = Just (K.Undef stackTy)}
-  emitDefn $ GlobalDefinition globalVariableDefaults {
-    G.name = "top",
-    G.type' = i32,
-    G.initializer = Just (K.Int 32 (-1))}
-  let stack = ConstantOperand (K.GlobalReference (ptr stackTy) "stack")
-      top = ConstantOperand (K.GlobalReference (ptr i32) "top")
-  pushArg <- fmap repair . function "push_arg"
-    [(closP, NoParameterName)] void $ \[arg] -> do
-    topV <- load top 0
-    topV' <- add topV (lit 1)
-    store top 0 topV'
-    sp <- gep stack [lit 0, topV']
-    store sp 0 arg
-  popArg <- fmap repair . function "pop_arg" [] closP $ \[] -> do
-    topV <- load top 0
-    topV' <- sub topV (lit 1)
-    store top 0 topV'
-    sp <- gep stack [lit 0, topV]
-    arg <- load sp 0
-    store sp 0 (ConstantOperand (K.Null closP))
-    ret arg
+    [(i64, ParameterName "field_count"), (fty, ParameterName "proc")]
+    closP $ \[fc, proc] -> do
+    fsize <- mul fc (lit64 8) `named` "fsize"
+    size <- add fsize (lit64 8) `named` "size"
+    closMem <- call calloc [(lit64 1, []), (size, [])] `named` "mem"
+    clos <- bitcast closMem closP `named` "clos"
+    enter <- gep clos [lit 0, lit 0] `named` "enter"
+    store enter 0 proc
+    ret clos
   return Env {
     _closPtrType = closP,
     _allocClosure = allocClosure,
-    _pushArg = pushArg,
-    _popArg = popArg
+    _calloc = calloc
   }
 

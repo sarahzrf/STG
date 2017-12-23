@@ -4,7 +4,9 @@
 dist
 cabal-dev
 *.o
+*.dyn_o
 *.hi
+*.dyn_hi
 *.chi
 *.chs.h
 .virtualenv

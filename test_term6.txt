@@ -1,0 +1,3 @@
+let fix f = (\x -> f (x x)) (\x -> f (x x))
+    sumtorial = fix (\rec n acc -> if n == 0 then acc else rec (n - 1) (acc + n))
+in sumtorial 100 0
