@@ -7,12 +7,14 @@ import Lam
 import LLVM2 (compileToLL)
 import System.Environment
 
-main :: IO ()
-main = do
-  code <- getContents
+generate :: String -> IO BS.ByteString
+generate code =
   let l = either error id (parseLam code)
       Just l' = closed l
-  -- print $! reduce l
+  in compileToLL l'
+
+main :: IO ()
+main = do
   a <- getArgs
-  compileToLL l' >>= BS.writeFile (a !! 0)
+  getContents >>= generate >>= BS.writeFile (a !! 0)
 

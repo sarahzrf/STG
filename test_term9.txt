@@ -1,0 +1,12 @@
+let fix f = (\x -> f (x x)) (\x -> f (x x))
+    zipWith f = fix (\rec xs ys ->
+      case xs of
+        Nil -> Nil []
+        Cons x xs' ->
+          case ys of
+            Nil -> Nil []
+            Cons y ys' -> Cons [f x y, rec xs' ys'])
+    ix = fix (\rec l i ->
+      case l of
+        Cons x xs -> if i == 0 then x else rec xs (i - 1))
+in ix (zipWith (\x y -> x + y) (Cons [1, Cons [2, Nil []]]) (Cons [3, Cons [4, Nil []]])) 1

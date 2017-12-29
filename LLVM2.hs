@@ -65,7 +65,7 @@ mkClosure proc fields = do
   clos <- call alloc [(lit64 (length fields), []), (proc, [])]
 
   when (not (null fields)) $ do
-    fsp <- gep clos [lit 0, lit 1] `named` "fieldsp_new"
+    fsp <- closFieldsp clos `named` "fieldsp_new"
     fs <- load fsp 0 `named` "fields_new"
     forM_ (zip fields [0..]) $ \(fr, i) -> do
       field <- gep fs [lit i] `named` "fieldp_new"
@@ -97,7 +97,7 @@ closureProc l = do
     fields <- case free of
       [] -> return []
       _ -> do
-        fsp <- gep cur [lit 0, lit 1] `named` "fieldsp_cur"
+        fsp <- closFieldsp cur `named` "fieldsp_cur"
         fs <- load fsp 0 `named` "fields_cur"
         forM [0..length free - 1] $ \i -> do
           field <- gep fs [lit i] `named` "closedp"
@@ -122,27 +122,72 @@ thunk l = do
 scrutinize :: Args -> Lam Operand -> FunB Operand
 scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) (0, 0))
 
-compile :: Pos r -> Args -> Lam Operand -> FunB r
-compile p args@(Args stk argc _) l = case l of
-  Var clos -> do
-    enter <- gep clos [lit 0, lit 0] `named` "enter"
-    proc <- load enter 0 `named` "proc"
-    let t = case p of Res -> Just MustTail; Scrut -> Nothing
-        -- builder API doesn't support indicating tail calls :(
-        instr = Call {
-          tailCallKind = t,
+-- builder API doesn't support indicating tail calls :(
+call' ::
+  MonadIRBuilder m =>
+  Maybe TailCallKind -> Operand -> [Operand] -> m Operand
+call' tck proc args = emitInstr resTy instr
+  where instr = Call {
+          tailCallKind = tck,
           callingConvention = CC.C,
           returnAttributes = [],
           AST.function = Right proc,
-          arguments = [(clos, []), (stk, []), (argc, [])],
+          arguments = zip args (repeat []),
           functionAttributes = [],
           metadata = []}
-    result p $ emitInstr resTy instr
+
+compile :: Pos r -> Args -> Lam Operand -> FunB r
+compile p args@(Args stk argc change) l = case l of
+  Var clos -> do
+    let (minChange, netChange) = change
+        possiblyNotFunc = netChange == minChange
+    enter <- closEnter clos `named` "enter"
+    proc <- load enter 0 `named` "proc"
+    argc' <- add argc (lit netChange) `named` "arg_count"
+    let doCall tck = emitInstr resTy Call {
+          tailCallKind = tck,
+          callingConvention = CC.C,
+          returnAttributes = [],
+          AST.function = Right proc,
+          arguments = [(clos, []), (stk, []), (argc', [])],
+          functionAttributes = [],
+          metadata = []}
+    if possiblyNotFunc then do
+      case p of
+        Res -> do
+          thunkLabel <- freshName "thunk"
+          funcLabel <- freshName "func"
+          isThunk <- icmp IP.EQ argc' (lit 0) `named` "is_thunk"
+          condBr isThunk thunkLabel funcLabel
+          emitBlockStart thunkLabel
+          res <- doCall Nothing `named` "res"
+          (resClosv res `named` "closv") >>= store clos 0
+          ret res
+          emitBlockStart funcLabel
+          (doCall (Just MustTail) `named` "res") >>= ret
+        Scrut -> do
+          res <- doCall Nothing
+          thunkLabel <- freshName "thunk"
+          funcLabel <- freshName "func"
+          isThunk <- icmp IP.EQ argc' (lit 0) `named` "is_thunk"
+          condBr isThunk thunkLabel funcLabel
+          emitBlockStart thunkLabel
+          (resClosv res `named` "closv") >>= store clos 0
+          br funcLabel
+          emitBlockStart funcLabel
+          return res
+    else result p . doCall $ case p of Res -> Just MustTail; Scrut -> Nothing
   Abs (Name s) b -> do
     (arg, args') <- pop args `named` fromString s
     compile p args' (instantiate1 (Var arg) b)
   App f x -> do
     clos <- thunk x `named` "arg"
+    args' <- push args clos
+    compile p args' f
+  -- TODO this only works for args that are not functions
+  SApp f x -> do
+    clos <- thunk x `named` "arg"
+    scrutinize args (Var clos)
     args' <- push args clos
     compile p args' f
   Lit i -> do

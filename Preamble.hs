@@ -21,10 +21,14 @@ data Env =
     calloc :: Operand} deriving (Show)
 
 -- this compensates for a bug in llvm-hs{,-pure}
-repair :: Operand -> Operand
-repair (ConstantOperand (K.GlobalReference ty name)) =
+repairGlobal :: Operand -> Operand
+repairGlobal (ConstantOperand (K.GlobalReference ty name)) =
   ConstantOperand (K.GlobalReference (ptr ty) name)
-repair _ = error "misuse of repair"
+repairGlobal _ = error "misuse of repairGlobal"
+
+localTy :: Type -> Operand -> Operand
+localTy ty (LocalReference _ name) = LocalReference ty name
+localTy _ o = o
 
 closTyName, resTyName :: Name
 closTy, closP, closA, resTy :: Type
@@ -54,6 +58,11 @@ mkRes i c = flip named "res" $ do
   s <- insert 0 i (undef resTy)
   maybe return (insert 1) c s
 
+-- these compensate for a bug in llvm-hs{,-pure}
+closEnter, closFieldsp :: MonadIRBuilder m => Operand -> m Operand
+closEnter clos = localTy (ptr funTy) <$> gep clos [lit 0, lit 0]
+closFieldsp clos = localTy (ptr closA) <$> gep clos [lit 0, lit 1]
+
 resInt, resClosv :: MonadIRBuilder m => Operand -> m Operand
 resInt res = emitInstr i32 (ExtractValue res [0] [])
 resClosv res = emitInstr closTy (ExtractValue res [1] [])
@@ -62,8 +71,8 @@ preamble :: ModuleBuilder Env
 preamble = do
   typedef closTyName (Just closDef)
   typedef resTyName (Just resDef)
-  calloc <- repair <$> extern "calloc" [i64, i64] (ptr i8)
-  allocClosure <- fmap repair . function "alloc_closure"
+  calloc <- repairGlobal <$> extern "calloc" [i64, i64] (ptr i8)
+  allocClosure <- fmap repairGlobal . function "alloc_closure"
     [(i64, ParameterName "field_count"), (funTy, ParameterName "proc")]
     closP $ \[fc, proc] -> do
     fsMem <- call calloc [(fc, []), (lit64 8, [])] `named` "fields_mem"
@@ -76,7 +85,7 @@ preamble = do
     store fsp 0 fs
     ret clos
 {-
-  allocPush <- fmap repair . function "alloc_push"
+  allocPush <- fmap repairGlobal . function "alloc_push"
     [(closA, ParameterName "stack"), (closTy, ParameterName "closv")]
     closA $ \[stk, closv] -> do
     closMem <- call calloc [(lit64 1, []), (lit64 16, [])] `named` "clos_mem"
@@ -89,7 +98,7 @@ preamble = do
   let params = [(closP, ParameterName "cur_clos"),
                 (closA, ParameterName "stack"),
                 (i32, ParameterName "arg_count")]
-  iproc <- fmap repair . function "iproc"
+  iproc <- fmap repairGlobal . function "iproc"
     params resTy $ \[cur, stk, argc] -> do
     cur' <- load cur 0 `named` "cur_clos_struct"
     fs <- emitInstr closA (ExtractValue cur' [1] []) `named` "fieldsp"

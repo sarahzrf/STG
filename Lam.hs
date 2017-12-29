@@ -34,6 +34,7 @@ data Lam a =
   -- machinery in order to, e.g., traverse free variables.
   | Abs Name (Scope () Lam a)
   | App (Lam a) (Lam a)
+  | SApp (Lam a) (Lam a)
   | Lit Int
   | Op AOp (Lam a) (Lam a)
   | Ctor Name [Lam a]
@@ -56,6 +57,7 @@ instance Monad Lam where
     Var v -> k v
     Abs name b -> Abs name (b >>>= k)
     App f x -> App (f >>= k) (x >>= k)
+    SApp f x -> SApp (f >>= k) (x >>= k)
     Lit i -> Lit i
     Op op x y -> Op op (x >>= k) (y >>= k)
     Ctor name fs -> Ctor name (map (>>= k) fs)
@@ -85,6 +87,10 @@ simplify' :: Lam a -> Maybe (Lam a)
 simplify' l = case l of
   App (Abs _ b) x -> Just (instantiate1 x b)
   App f x -> App <$> simplify' f <&> x
+  SApp (Abs name b) x -> Just $ case simplify' x of
+    Nothing -> instantiate1 x b
+    Just x' -> SApp (Abs name b) x'
+  SApp f x -> SApp <$> simplify' f <&> x
 
   Op o (Lit x) (Lit y) -> pure (aOp o x y)
   Op o x y -> Op o <$> simplify' x <&> y <|>
@@ -112,6 +118,8 @@ hs2lam :: Show a => X.Exp a -> Either String (Lam Name)
 hs2lam exp = case exp of
   X.Var _ (X.UnQual _ (X.Ident _ v)) -> Right (Var (Name v))
   X.Lit _ (X.Int _ n _) -> Right (Lit (fromIntegral n))
+  X.InfixApp _ f (X.QVarOp _ (X.UnQual _ (X.Symbol _ "$!"))) x ->
+    liftA2 SApp (hs2lam f) (hs2lam x)
   X.InfixApp _ l (X.QVarOp _ (X.UnQual _ (X.Symbol _ o))) r
     | Just o' <- lookup o [("+", Add), ("-", Sub),
                            ("==", Eq), ("<=", Leq)] ->
