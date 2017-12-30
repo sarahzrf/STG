@@ -5,7 +5,6 @@
 module LLVM2 where
 
 import Bound.Scope
-import Control.Lens
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.ByteString (ByteString)
@@ -76,7 +75,8 @@ mkClosure proc fields = do
 mkProc ::
   (Operand -> Operand -> Operand -> Operand -> FunB ()) -> ModB Operand
 mkProc body = do
-  freshNum <- id <<+= 1
+  freshNum <- get
+  put (freshNum + 1)
   let funName = mkName ("proc." ++ show freshNum)
       params = [(closP, ParameterName "cur_clos"),
                 (closA, ParameterName "stack"),
