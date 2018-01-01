@@ -30,7 +30,7 @@ data Lam a =
   | Abs Name (Scope () Lam a)
   | App (Lam a) (Lam a)
   | SApp (Lam a) (Lam a)
-  | Let Name (Lam a) (Scope () Lam a)
+  | Let Name (Scope () Lam a) (Scope () Lam a)
   | Lit Int
   | Op AOp (Lam a) (Lam a)
   | Ctor Name [Lam a]
@@ -54,7 +54,7 @@ instance Monad Lam where
     Abs name b -> Abs name (b >>>= k)
     App f x -> App (f >>= k) (x >>= k)
     SApp f x -> SApp (f >>= k) (x >>= k)
-    Let name x b -> Let name (x >>= k) (b >>>= k)
+    Let name x b -> Let name (x >>>= k) (b >>>= k)
     Lit i -> Lit i
     Op op x y -> Op op (x >>= k) (y >>= k)
     Ctor name fs -> Ctor name (map (>>= k) fs)
@@ -65,7 +65,7 @@ abs_ :: String -> Lam Name -> Lam Name
 abs_ s b = Abs (Name s) (abstract1 (Name s) b)
 
 let_ :: String -> Lam Name -> Lam Name -> Lam Name
-let_ s x b = Let (Name s) x (abstract1 (Name s) b)
+let_ s x b = Let (Name s) (abstract1 (Name s) x) (abstract1 (Name s) b)
 
 aOp :: AOp -> Int -> Int -> Lam a
 aOp o x y = case o of
@@ -91,7 +91,9 @@ simplify' l = case l of
     Nothing -> instantiate1 x b
     Just x' -> SApp (Abs name b) x'
   SApp f x -> SApp <$> simplify' f <&> x
-  Let name x b -> Just (instantiate1 x b)
+  Let name x b ->
+    let x' = instantiate1 (Let name x (Scope (Var (B ())))) x
+    in Just (instantiate1 x' b)
 
   Op o (Lit x) (Lit y) -> pure (aOp o x y)
   Op o x y -> Op o <$> simplify' x <&> y <|>

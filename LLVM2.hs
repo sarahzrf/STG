@@ -1,9 +1,9 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE StandaloneDeriving #-}
 module LLVM2 where
 
+import Bound
 import Bound.Scope
 import Control.Monad.Reader
 import Control.Monad.State
@@ -58,10 +58,13 @@ result :: Pos r -> FunB Operand -> FunB r
 result Res o = o `named` "res" >>= ret
 result Scrut o = o
 
-mkClosure :: Operand -> [Operand] -> FunB Operand
-mkClosure proc fields = do
+-- In order to support recursive definitions, we need to account for the fact
+-- that a field of the closure may depend on the closure itself
+mkClosure :: Operand -> [Operand -> FunB Operand] -> FunB Operand
+mkClosure proc fieldAs = do
   alloc <- asks allocClosure
-  clos <- call alloc [(lit64 (length fields), []), (proc, [])]
+  clos <- call alloc [(lit64 (length fieldAs), []), (proc, [])]
+  fields <- mapM ($ clos) fieldAs
 
   when (not (null fields)) $ do
     fsp <- closFieldsp clos `named` "fieldsp_new"
@@ -86,7 +89,7 @@ mkProc body = do
   function funName params resTy body'
   return proc
 
-closureProc :: Lam Operand -> FunB (Operand, [Operand])
+closureProc :: Eq a => Lam a -> FunB (Operand, [a])
 closureProc l = do
   let (li, free) = runState (traverse (state . replace) l) []
       replace v seen = case findIndex (==v) seen of
@@ -107,17 +110,25 @@ closureProc l = do
 
   return (proc, free)
 
-thunk :: Lam Operand -> FunB Operand
-thunk (Var clos) = return clos
+-- F is a normal free variable and B is a circular reference to the thunk
+-- itself. "let x = x in ..." will have undefined behavior if x is forced in
+-- "...".
+thunk :: Lam (Var () Operand) -> FunB Operand
+thunk (Var (B ())) = return (undef closP)
+thunk (Var (F clos)) = return clos
 thunk (Ctor name fs) = do
   proc <- lift . mkProc $ \proc cur stk argc -> do
     cur' <- load cur 0 `named` "cur_closv"
     mkRes (lit (hashCode name)) (Just cur') >>= ret
-  fields <- forM fs $ \f -> thunk f `named` "field_new"
-  mkClosure proc fields
+  let free self (B ()) = F self
+      free self (F o)  = F o
+      field f self = thunk (free self <$> f) `named` "field_new"
+  mkClosure proc (map field fs)
 thunk l = do
   (proc, free) <- closureProc l
-  mkClosure proc free
+  let field (B ()) self = return self
+      field (F clos) self = return clos
+  mkClosure proc (map field free)
 
 scrutinize :: Args -> Lam Operand -> FunB Operand
 scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) (0, 0))
@@ -168,17 +179,17 @@ compile p args@(Args stk argc change) l = case l of
     (arg, args') <- pop args `named` fromString s
     compile p args' (instantiate1 (Var arg) b)
   App f x -> do
-    clos <- thunk x `named` "arg"
+    clos <- thunk (F <$> x) `named` "arg"
     args' <- push args clos
     compile p args' f
   -- TODO this only works for args that are not functions
   SApp f x -> do
-    clos <- thunk x `named` "arg"
+    clos <- thunk (F <$> x) `named` "arg"
     scrutinize args (Var clos)
     args' <- push args clos
     compile p args' f
   Let (Name s) x b -> do
-    clos <- thunk x `named` fromString s
+    clos <- thunk (fromScope x) `named` fromString s
     compile p args (instantiate1 (Var clos) b)
   Lit i -> do
     case p of
@@ -212,7 +223,7 @@ compile p args@(Args stk argc change) l = case l of
         mkRes val (Just s')
       Scrut -> mkRes val Nothing
   Ctor name fs -> do
-    clos <- thunk l `named` "ctor"
+    clos <- thunk (F <$> l) `named` "ctor"
     -- TODO just make the closure struct w/o allocating-then-loading
     closv <- load clos 0 `named` "closv_new"
     result p $ mkRes (lit (hashCode name)) (Just closv)

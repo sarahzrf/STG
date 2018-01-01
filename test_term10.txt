@@ -1,17 +1,14 @@
-let fix f = (\x -> f (x x)) (\x -> f (x x))
-    tail l = case l of Cons x xs -> xs
-    zipWith f = fix (\rec xs ys ->
+let tail l = case l of Cons x xs -> xs
+    zipWith f xs ys =
       case xs of
         Nil -> Nil []
         Cons x xs' ->
           case ys of
             Nil -> Nil []
-            Cons y ys' -> Cons [f x y, rec xs' ys'])
-    fibs = fix (\fibs -> Cons [1, Cons [1,
-        -- TODO I don't think this shares
+            Cons y ys' -> Cons [f x y, zipWith f xs' ys']
+    fibs = Cons [1, Cons [1,
         zipWith (\x y -> x + y) fibs (tail fibs)
-      ]])
-    ix = fix (\rec l i ->
-      case l of
-        Cons x xs -> if i == 0 then x else rec xs (i - 1))
-in ix fibs 30
+      ]]
+    ix l i = case l of
+      Cons x xs -> if i == 0 then x else ix xs (i - 1)
+in ix fibs 100000
