@@ -25,16 +25,12 @@ hashCode (Name s) = sum (zipWith e s [1..])
 data AOp = Add | Sub | Eq | Leq deriving Show
 data Lam a =
     Var a
-  -- Keeping around the name of the bound variable will be useful.
-  -- We'll never do freshening, though; we don't care about names in the simple
-  -- interpreter below, so it doesn't matter, and in the STG stuff, we either
-  -- use nested scopes or replace free names with closure indices.
-  -- We could just abandon the Bound stuff entirely and work with plain
-  -- concrete terms, but we'd end up having to implement a lot of the same
-  -- machinery in order to, e.g., traverse free variables.
+  -- Keeping around the name of the bound variable will be nice for readability
+  -- in the output.
   | Abs Name (Scope () Lam a)
   | App (Lam a) (Lam a)
   | SApp (Lam a) (Lam a)
+  | Let Name (Lam a) (Scope () Lam a)
   | Lit Int
   | Op AOp (Lam a) (Lam a)
   | Ctor Name [Lam a]
@@ -58,6 +54,7 @@ instance Monad Lam where
     Abs name b -> Abs name (b >>>= k)
     App f x -> App (f >>= k) (x >>= k)
     SApp f x -> SApp (f >>= k) (x >>= k)
+    Let name x b -> Let name (x >>= k) (b >>>= k)
     Lit i -> Lit i
     Op op x y -> Op op (x >>= k) (y >>= k)
     Ctor name fs -> Ctor name (map (>>= k) fs)
@@ -65,7 +62,10 @@ instance Monad Lam where
     where clause (Clause name names b) = Clause name names (b >>>= k)
 
 abs_ :: String -> Lam Name -> Lam Name
-abs_ name b = Abs (Name name) (abstract1 (Name name) b)
+abs_ s b = Abs (Name s) (abstract1 (Name s) b)
+
+let_ :: String -> Lam Name -> Lam Name -> Lam Name
+let_ s x b = Let (Name s) x (abstract1 (Name s) b)
 
 aOp :: AOp -> Int -> Int -> Lam a
 aOp o x y = case o of
@@ -91,6 +91,7 @@ simplify' l = case l of
     Nothing -> instantiate1 x b
     Just x' -> SApp (Abs name b) x'
   SApp f x -> SApp <$> simplify' f <&> x
+  Let name x b -> Just (instantiate1 x b)
 
   Op o (Lit x) (Lit y) -> pure (aOp o x y)
   Op o x y -> Op o <$> simplify' x <&> y <|>
@@ -142,11 +143,10 @@ hs2lam exp = case exp of
   X.Let _ (X.BDecls _ []) b -> hs2lam b
   X.Let p (X.BDecls p'
     (X.FunBind p'' [X.Match _ (X.Ident _ v) pats (XUG fb) _]:as)) b ->
-    liftA2 (\e' b' -> abs_ v b' `App` e')
+    liftA2 (let_ v)
       (hs2lam (X.Lambda p'' pats fb)) (hs2lam (X.Let p (X.BDecls p' as) b))
   X.Let p (X.BDecls p' (X.PatBind _ (XVar v) (XUG e) _:as)) b ->
-    liftA2 (\e' b' -> abs_ v b' `App` e')
-      (hs2lam e) (hs2lam (X.Let p (X.BDecls p' as) b))
+    liftA2 (let_ v) (hs2lam e) (hs2lam (X.Let p (X.BDecls p' as) b))
   e -> Left ("unsupported expression type: " ++ show e)
   where clause (X.Alt _
                 (X.PApp _ (X.UnQual _ (X.Ident _ name)) ps)

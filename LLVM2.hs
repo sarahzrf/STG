@@ -122,20 +122,6 @@ thunk l = do
 scrutinize :: Args -> Lam Operand -> FunB Operand
 scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) (0, 0))
 
--- builder API doesn't support indicating tail calls :(
-call' ::
-  MonadIRBuilder m =>
-  Maybe TailCallKind -> Operand -> [Operand] -> m Operand
-call' tck proc args = emitInstr resTy instr
-  where instr = Call {
-          tailCallKind = tck,
-          callingConvention = CC.C,
-          returnAttributes = [],
-          AST.function = Right proc,
-          arguments = zip args (repeat []),
-          functionAttributes = [],
-          metadata = []}
-
 compile :: Pos r -> Args -> Lam Operand -> FunB r
 compile p args@(Args stk argc change) l = case l of
   Var clos -> do
@@ -144,6 +130,7 @@ compile p args@(Args stk argc change) l = case l of
     enter <- closEnter clos `named` "enter"
     proc <- load enter 0 `named` "proc"
     argc' <- add argc (lit netChange) `named` "arg_count"
+    -- builder API doesn't support indicating tail calls :(
     let doCall tck = emitInstr resTy Call {
           tailCallKind = tck,
           callingConvention = CC.C,
@@ -166,7 +153,7 @@ compile p args@(Args stk argc change) l = case l of
           emitBlockStart funcLabel
           (doCall (Just MustTail) `named` "res") >>= ret
         Scrut -> do
-          res <- doCall Nothing
+          res <- doCall Nothing `named` "res"
           thunkLabel <- freshName "thunk"
           funcLabel <- freshName "func"
           isThunk <- icmp IP.EQ argc' (lit 0) `named` "is_thunk"
@@ -190,6 +177,9 @@ compile p args@(Args stk argc change) l = case l of
     scrutinize args (Var clos)
     args' <- push args clos
     compile p args' f
+  Let (Name s) x b -> do
+    clos <- thunk x `named` fromString s
+    compile p args (instantiate1 (Var clos) b)
   Lit i -> do
     case p of
       Res -> do
@@ -224,7 +214,7 @@ compile p args@(Args stk argc change) l = case l of
   Ctor name fs -> do
     clos <- thunk l `named` "ctor"
     -- TODO just make the closure struct w/o allocating-then-loading
-    closv <- load clos 0
+    closv <- load clos 0 `named` "closv_new"
     result p $ mkRes (lit (hashCode name)) (Just closv)
   Case x cs -> do
     x' <- scrutinize args x `named` "scrutinee"
@@ -239,9 +229,9 @@ compile p args@(Args stk argc change) l = case l of
     switch hash defaultLabel . map dest $ branchLabels
     phis <- forM branchLabels $ \(Clause name names b, label) -> do
       emitBlockStart label
-      fields <- forM [0..length names - 1] $ \i -> do
-        fieldp <- gep fs [lit i] `named` "fieldp_res"
-        load fieldp 0 `named` "field_res"
+      fields <- forM (zip [0..] names) $ \(i, Name s) -> do
+        fieldp <- gep fs [lit i] `named` fromString (s ++ "p")
+        load fieldp 0 `named` fromString s
       r <- compile p args (instantiateVars fields b)
       () <- case p of Res -> return (); Scrut -> br resLabel
       -- this is kinda hacky...
