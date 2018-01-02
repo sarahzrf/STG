@@ -30,33 +30,74 @@ data Args =
   Args {
     stack :: Operand,
     argCount :: Operand,
-    argChange :: (Int, Int)
+    argChange :: Int
   } deriving (Show)
--- the state is the operand containing the current top of the stack
 type FunB = IRBuilderT ModB
 
 push :: Args -> Operand -> FunB Args
-push (Args stk argc (minChange, netChange)) x = do
+push (Args stk argc change) x = do
   stk' <- gep stk [lit 1] `named` "stack"
   store stk' 0 x
-  return (Args stk' argc (minChange, netChange + 1))
+  return (Args stk' argc (change + 1))
 
 pop :: Args -> FunB (Operand, Args)
-pop (Args stk argc (minChange, netChange)) = do
+pop (Args stk argc change) = do
   x <- load stk 0
   store stk 0 (undef closP)
   stk' <- gep stk [lit (-1)] `named` "stack"
-  let net' = netChange - 1
-  return (x, Args stk' argc (min minChange net', net'))
+  return (x, Args stk' argc (change - 1))
+
+-- builder API doesn't support indicating tail calls :(
+call' ::
+  MonadIRBuilder m =>
+  Operand -> [Operand] -> Maybe TailCallKind -> m Operand
+call' proc args tck = emitInstr resTy Call {
+  tailCallKind = tck,
+  callingConvention = CC.C,
+  returnAttributes = [],
+  AST.function = Right proc,
+  arguments = zip args (repeat []),
+  functionAttributes = [],
+  metadata = []}
 
 data Pos r where
   Res :: Pos ()
   Scrut :: Pos Operand
+  Force :: Pos Operand
 deriving instance Show (Pos r)
 
 result :: Pos r -> FunB Operand -> FunB r
 result Res o = o `named` "res" >>= ret
 result Scrut o = o
+result Force o = o
+
+-- The caller must supply an exhaustive list of possibilities or there will be
+-- undefined behavior!!!
+switchPos :: Pos r -> Operand -> [(K.Constant, FunB r)] -> FunB r
+switchPos p x branches = do
+  defaultLabel <- freshName "default"
+  resLabel <- freshName "res"
+  labelled <- forM branches $ \b -> (,) b <$> freshName "branch"
+  switch x defaultLabel . flip map labelled $ \((k, _), l) -> (k, l)
+  phis <- forM labelled $ \((_, body), label) -> do
+    emitBlockStart label
+    r <- body
+    () <- case p of Res -> return (); _ -> br resLabel
+    -- this is kinda hacky...
+    let l IRBuilderState {builderBlock =
+      Just PartialBlock {partialBlockName = name}} = name
+    curLabel <- liftIRState (gets l)
+    return (r, curLabel)
+  emitBlockStart defaultLabel
+  unreachable
+  case p of
+    Res -> return ()
+    Scrut -> do
+      emitBlockStart resLabel
+      phi phis
+    Force -> do
+      emitBlockStart resLabel
+      phi phis
 
 -- In order to support recursive definitions, we need to account for the fact
 -- that a field of the closure may depend on the closure itself
@@ -106,7 +147,19 @@ closureProc l = do
           field <- gep fs [lit i] `named` "closedp"
           load field 0 `named` "closed"
     let l' = (fields !!) <$> li
-    compile Res (Args stk argc (0, 0)) l'
+    case l' of
+     Abs (Name s) b -> do
+        (arg, args') <- pop (Args stk argc 0) `named` fromString s
+        compile Res args' (instantiate1 (Var arg) b)
+     _ -> do
+       res <- compile Force (Args stk (lit 0) 0) l' `named` "res"
+       closv <- resClosv res `named` "closv"
+       store cur 0 closv
+       haveArg <- icmp IP.UGT argc (lit 0) `named` "have_arg"
+       switchPos Res haveArg [(K.Int 1 0, ret res),
+                              (K.Int 1 1, do
+         proc <- emitInstr funTy (ExtractValue closv [0] []) `named` "proc"
+         call' proc [cur, stk, argc] (Just MustTail) `named` "res" >>= ret)]
 
   return (proc, free)
 
@@ -130,61 +183,43 @@ thunk l = do
       field (F clos) self = return clos
   mkClosure proc (map field free)
 
+-- nsr = no self-reference
+nsrThunk :: Lam Operand -> FunB Operand
+nsrThunk = thunk . fmap F
+
 scrutinize :: Args -> Lam Operand -> FunB Operand
-scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) (0, 0))
+scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) 0)
 
 compile :: Pos r -> Args -> Lam Operand -> FunB r
 compile p args@(Args stk argc change) l = case l of
   Var clos -> do
-    let (minChange, netChange) = change
-        possiblyNotFunc = netChange == minChange
     enter <- closEnter clos `named` "enter"
     proc <- load enter 0 `named` "proc"
-    argc' <- add argc (lit netChange) `named` "arg_count"
-    -- builder API doesn't support indicating tail calls :(
-    let doCall tck = emitInstr resTy Call {
-          tailCallKind = tck,
-          callingConvention = CC.C,
-          returnAttributes = [],
-          AST.function = Right proc,
-          arguments = [(clos, []), (stk, []), (argc', [])],
-          functionAttributes = [],
-          metadata = []}
-    if possiblyNotFunc then do
-      case p of
-        Res -> do
-          thunkLabel <- freshName "thunk"
-          funcLabel <- freshName "func"
-          isThunk <- icmp IP.EQ argc' (lit 0) `named` "is_thunk"
-          condBr isThunk thunkLabel funcLabel
-          emitBlockStart thunkLabel
-          res <- doCall Nothing `named` "res"
-          (resClosv res `named` "closv") >>= store clos 0
-          ret res
-          emitBlockStart funcLabel
-          (doCall (Just MustTail) `named` "res") >>= ret
-        Scrut -> do
-          res <- doCall Nothing `named` "res"
-          thunkLabel <- freshName "thunk"
-          funcLabel <- freshName "func"
-          isThunk <- icmp IP.EQ argc' (lit 0) `named` "is_thunk"
-          condBr isThunk thunkLabel funcLabel
-          emitBlockStart thunkLabel
-          (resClosv res `named` "closv") >>= store clos 0
-          br funcLabel
-          emitBlockStart funcLabel
-          return res
-    else result p . doCall $ case p of Res -> Just MustTail; Scrut -> Nothing
+    argc' <- case p of
+      Res -> add argc (lit change) `named` "arg_count"
+      _ -> return (lit change)
+    let tck = case p of Res -> Just MustTail; _ -> Nothing
+    result p $ call' proc [clos, stk, argc'] tck
   Abs (Name s) b -> do
-    (arg, args') <- pop args `named` fromString s
-    compile p args' (instantiate1 (Var arg) b)
+    let doApply = do
+          (arg, args') <- pop args `named` fromString s
+          compile p args' (instantiate1 (Var arg) b)
+    if change <= 0 then do
+      haveArg <- icmp IP.UGT argc (lit (-change)) `named` "have_arg"
+      -- TODO just make the result struct w/o allocating-then-loading
+      switchPos p haveArg [(K.Int 1 1, doApply),
+                           (K.Int 1 0, do
+        clos <- nsrThunk l `named` "pap"
+        closv <- load clos 0 `named` "closv_new"
+        result p $ mkRes (undef i32) (Just closv))]
+-- result p (nsrThunk l))]
+    else doApply
   App f x -> do
-    clos <- thunk (F <$> x) `named` "arg"
+    clos <- nsrThunk x `named` "arg"
     args' <- push args clos
     compile p args' f
-  -- TODO this only works for args that are not functions
   SApp f x -> do
-    clos <- thunk (F <$> x) `named` "arg"
+    clos <- nsrThunk x `named` "arg"
     scrutinize args (Var clos)
     args' <- push args clos
     compile p args' f
@@ -193,16 +228,16 @@ compile p args@(Args stk argc change) l = case l of
     compile p args (instantiate1 (Var clos) b)
   Lit i -> do
     case p of
-      Res -> do
+      Scrut -> mkRes (lit i) Nothing
+      _ -> result p $ do
         -- TODO this creates duplicate identical functions when making
         -- a thunk from a literal
         let insert proc = InsertValue (undef closTy) proc [0] []
             body proc = do
               clos' <- emitInstr closTy (insert proc)
-              mkRes (lit i) (Just clos') >>= ret
-        proc <- lift . mkProc $ \proc _ _ _ -> body proc
+              mkRes (lit i) (Just clos')
+        proc <- lift . mkProc $ \proc _ _ _ -> body proc >>= ret
         body proc
-      Scrut -> mkRes (lit i) Nothing
   Op op x y -> do
     x' <- (scrutinize args x >>= resInt) `named` "lhs"
     y' <- (scrutinize args y >>= resInt) `named` "rhs"
@@ -214,16 +249,16 @@ compile p args@(Args stk argc change) l = case l of
       Eq  -> icmp IP.EQ x' y' >>= sel
       Leq -> icmp IP.SLE x' y' >>= sel
     result p $ case p of
-      Res -> do
+      Scrut -> mkRes val Nothing
+      _ -> do
         pval <- inttoptr val closA `named` "pval"
         proc <- asks iproc
         s <- emitInstr closTy
           (InsertValue (undef closTy) proc [0] []) `named` "closv_res"
         s' <- emitInstr closTy (InsertValue s pval [1] []) `named` "closv_res"
         mkRes val (Just s')
-      Scrut -> mkRes val Nothing
   Ctor name fs -> do
-    clos <- thunk (F <$> l) `named` "ctor"
+    clos <- nsrThunk l `named` "ctor"
     -- TODO just make the closure struct w/o allocating-then-loading
     closv <- load clos 0 `named` "closv_new"
     result p $ mkRes (lit (hashCode name)) (Just closv)
@@ -232,36 +267,17 @@ compile p args@(Args stk argc change) l = case l of
     hash <- resInt x' `named` "hash"
     closv <- resClosv x' `named` "closv_res"
     fs <- emitInstr closA (ExtractValue closv [1] []) `named` "fields_res"
-    defaultLabel <- freshName "default"
-    resLabel <- freshName "res"
-    branchLabels <- forM cs $ \c -> (,) c <$> freshName "branch"
-    let dest (Clause name _ _, label) =
-          (K.Int 32 (toInteger (hashCode name)), label)
-    switch hash defaultLabel . map dest $ branchLabels
-    phis <- forM branchLabels $ \(Clause name names b, label) -> do
-      emitBlockStart label
-      fields <- forM (zip [0..] names) $ \(i, Name s) -> do
-        fieldp <- gep fs [lit i] `named` fromString (s ++ "p")
-        load fieldp 0 `named` fromString s
-      r <- compile p args (instantiateVars fields b)
-      () <- case p of Res -> return (); Scrut -> br resLabel
-      -- this is kinda hacky...
-      let l IRBuilderState {builderBlock =
-        Just PartialBlock {partialBlockName = name}} = name
-      curLabel <- liftIRState (gets l)
-      return (r, curLabel)
-    emitBlockStart defaultLabel
-    unreachable
-    case p of
-      Res -> return ()
-      Scrut -> do
-        emitBlockStart resLabel
-        phi phis
+    switchPos p hash . flip map cs $ \(Clause name names b) ->
+      (K.Int 32 (toInteger (hashCode name)), do
+        fields <- forM (zip [0..] names) $ \(i, Name s) -> do
+          fieldp <- gep fs [lit i] `named` fromString (s ++ "p")
+          load fieldp 0 `named` fromString s
+        compile p args (instantiateVars fields b))
 
 compileMain :: Lam Operand -> ModuleBuilder ()
 compileMain l = do
   env <- preamble
-  let body proc cur stk argc = compile Res (Args stk argc (0, 0)) l
+  let body proc cur stk argc = compile Res (Args stk argc 0) l
   outer <- evalStateT (runReaderT (mkProc body) env) 0
   let calloc' = calloc env
   void . function "main" [] i32 . const $ do

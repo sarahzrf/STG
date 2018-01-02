@@ -84,17 +84,6 @@ preamble = do
     fsp <- gep clos [lit 0, lit 1] `named` "fieldsp"
     store fsp 0 fs
     ret clos
-{-
-  allocPush <- fmap repairGlobal . function "alloc_push"
-    [(closA, ParameterName "stack"), (closTy, ParameterName "closv")]
-    closA $ \[stk, closv] -> do
-    closMem <- call calloc [(lit64 1, []), (lit64 16, [])] `named` "clos_mem"
-    clos <- bitcast closMem closP `named` "clos"
-    store clos 0 closv
-    stk' <- gep stk [lit 1] `named` "stack"
-    store stk' 0 clos
-    ret stk'
--}
   let params = [(closP, ParameterName "cur_clos"),
                 (closA, ParameterName "stack"),
                 (i32, ParameterName "arg_count")]

@@ -1,0 +1,8 @@
+let sumtorial n acc = if n == 0 then acc else sumtorial (n - 1) $! acc + n
+    const a b = a
+    map f l = case l of Nil -> Nil []; Cons x xs -> Cons [f x, map f xs]
+    sumN l i = if i == 0 then 0 else
+      case l of
+        Cons x xs -> x + sumN xs (i - 1)
+    ones = Cons [1, ones]
+in sumN (map (const (sumtorial 10000000 0)) ones) 50
