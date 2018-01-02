@@ -22,7 +22,7 @@ hashCode :: Name -> Int
 hashCode (Name s) = sum (zipWith e s [1..])
   where e c i = fromEnum c * 31^(length s - i)
 
-data AOp = Add | Sub | Eq | Leq deriving Show
+data AOp = Add | Sub | Mul | Div | Eq | Leq deriving Show
 data Lam a =
     Var a
   -- Keeping around the name of the bound variable will be nice for readability
@@ -71,6 +71,8 @@ aOp :: AOp -> Int -> Int -> Lam a
 aOp o x y = case o of
   Add -> Lit (x + y)
   Sub -> Lit (x - y)
+  Mul -> Lit (x * y)
+  Div -> Lit (x `quot` y)
   Eq  -> reflect (x == y)
   Leq -> reflect (x <= y)
   where reflect b = Ctor (Name (show b)) []
@@ -121,18 +123,23 @@ hs2lam :: Show a => X.Exp a -> Either String (Lam Name)
 hs2lam exp = case exp of
   X.Var _ (X.UnQual _ (X.Ident _ v)) -> Right (Var (Name v))
   X.Lit _ (X.Int _ n _) -> Right (Lit (fromIntegral n))
+  X.Lit _ (X.Char _ c _) -> Right (Lit (fromEnum c))
+  X.Lit _ (X.String _ s _) -> Right . embedList . map (Lit . fromEnum) $ s
   X.InfixApp _ f (X.QVarOp _ (X.UnQual _ (X.Symbol _ "$!"))) x ->
     liftA2 SApp (hs2lam f) (hs2lam x)
   X.InfixApp _ l (X.QVarOp _ (X.UnQual _ (X.Symbol _ o))) r
     | Just o' <- lookup o [("+", Add), ("-", Sub),
+                           ("*", Mul), ("/", Div),
                            ("==", Eq), ("<=", Leq)] ->
       liftA2 (Op o') (hs2lam l) (hs2lam r)
   X.InfixApp p l (X.QVarOp p' qn@(X.UnQual _ (X.Ident _ _))) r ->
     hs2lam (X.App p (X.App p (X.Var p' qn) l) r)
   X.App _ (X.Con _ (X.UnQual _ (X.Ident _ name))) (X.List _ as) ->
     Ctor (Name name) <$> traverse hs2lam as
+  X.List _ as -> embedList <$> traverse hs2lam as
   X.App _ f x -> liftA2 App (hs2lam f) (hs2lam x)
   X.NegApp _ (X.Lit _ (X.Int _ n _)) -> Right (Lit (-fromIntegral n))
+  X.NegApp _ n -> Op Sub (Lit 0) <$> hs2lam n
   X.Lambda _ [] b -> hs2lam b
   X.Lambda p (XVar v:as) b ->
     abs_ v <$> hs2lam (X.Lambda p as b)
@@ -150,7 +157,10 @@ hs2lam exp = case exp of
   X.Let p (X.BDecls p' (X.PatBind _ (XVar v) (XUG e) _:as)) b ->
     liftA2 (let_ v) (hs2lam e) (hs2lam (X.Let p (X.BDecls p' as) b))
   e -> Left ("unsupported expression type: " ++ show e)
-  where clause (X.Alt _
+  where embedList = foldr
+          (\x xs -> Ctor (Name "Cons") [x, xs])
+          (Ctor (Name "Nil") [])
+        clause (X.Alt _
                 (X.PApp _ (X.UnQual _ (X.Ident _ name)) ps)
                 (XUG b) Nothing)
           | Just fs <- traverse pvar ps =

@@ -1,2 +1,2 @@
 let sumtorial n = if n == 0 then 0 else n + sumtorial (n - 1)
-in sumtorial 100
+in Left [sumtorial 100]

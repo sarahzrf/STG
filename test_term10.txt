@@ -11,4 +11,4 @@ let tail l = case l of Cons x xs -> xs
       ]]
     ix l i = case l of
       Cons x xs -> if i == 0 then x else ix xs (i - 1)
-in ix fibs 100000
+in Left [ix fibs 100000]

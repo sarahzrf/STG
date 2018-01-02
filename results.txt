@@ -1,12 +1,14 @@
-7
-9
-4
-186
-2
-64
-0
-5
-6
-93
-128
-10
+term1:  7
+term2:  9
+term3:  4
+term4:  5050
+term5:  2
+term6:  -2004260032
+term7:  0
+term8:  5
+term9:  6
+term10: 679394397
+term11: -1428753792
+term12: 10
+term13: uryyb
+term14: 6

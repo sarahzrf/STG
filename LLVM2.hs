@@ -11,7 +11,7 @@ import Data.ByteString (ByteString)
 import Data.List
 import Data.String
 import Lam
-import LLVM.AST hiding (function, Name, Add, Sub)
+import LLVM.AST hiding (function, Name, Add, Sub, Mul)
 import qualified LLVM.AST as AST
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Constant as K
@@ -25,27 +25,7 @@ import Preamble
 -- looks like the place we'll need fresh names is in the monad that
 -- DOESN'T supply them...
 type ModB = ReaderT Env (StateT Int ModuleBuilder)
-
-data Args =
-  Args {
-    stack :: Operand,
-    argCount :: Operand,
-    argChange :: Int
-  } deriving (Show)
 type FunB = IRBuilderT ModB
-
-push :: Args -> Operand -> FunB Args
-push (Args stk argc change) x = do
-  stk' <- gep stk [lit 1] `named` "stack"
-  store stk' 0 x
-  return (Args stk' argc (change + 1))
-
-pop :: Args -> FunB (Operand, Args)
-pop (Args stk argc change) = do
-  x <- load stk 0
-  store stk 0 (undef closP)
-  stk' <- gep stk [lit (-1)] `named` "stack"
-  return (x, Args stk' argc (change - 1))
 
 -- builder API doesn't support indicating tail calls :(
 call' ::
@@ -148,18 +128,18 @@ closureProc l = do
           load field 0 `named` "closed"
     let l' = (fields !!) <$> li
     case l' of
-     Abs (Name s) b -> do
+      Abs (Name s) b -> do
         (arg, args') <- pop (Args stk argc 0) `named` fromString s
         compile Res args' (instantiate1 (Var arg) b)
-     _ -> do
-       res <- compile Force (Args stk (lit 0) 0) l' `named` "res"
-       closv <- resClosv res `named` "closv"
-       store cur 0 closv
-       haveArg <- icmp IP.UGT argc (lit 0) `named` "have_arg"
-       switchPos Res haveArg [(K.Int 1 0, ret res),
-                              (K.Int 1 1, do
-         proc <- emitInstr funTy (ExtractValue closv [0] []) `named` "proc"
-         call' proc [cur, stk, argc] (Just MustTail) `named` "res" >>= ret)]
+      _ -> do
+        res <- compile Force (Args stk (lit 0) 0) l' `named` "res"
+        closv <- resClosv res `named` "closv"
+        store cur 0 closv
+        haveArg <- icmp IP.UGT argc (lit 0) `named` "have_arg"
+        switchPos Res haveArg [(K.Int 1 0, ret res),
+                               (K.Int 1 1, do
+          proc <- emitInstr funTy (ExtractValue closv [0] []) `named` "proc"
+          call' proc [cur, stk, argc] (Just MustTail) `named` "res" >>= ret)]
 
   return (proc, free)
 
@@ -246,17 +226,13 @@ compile p args@(Args stk argc change) l = case l of
     val <- flip named "val" $ case op of
       Add -> add x' y'
       Sub -> sub x' y'
+      Mul -> mul x' y'
+      Div -> emitInstr i32 $ SDiv False x' y' []
       Eq  -> icmp IP.EQ x' y' >>= sel
       Leq -> icmp IP.SLE x' y' >>= sel
     result p $ case p of
       Scrut -> mkRes val Nothing
-      _ -> do
-        pval <- inttoptr val closA `named` "pval"
-        proc <- asks iproc
-        s <- emitInstr closTy
-          (InsertValue (undef closTy) proc [0] []) `named` "closv_res"
-        s' <- emitInstr closTy (InsertValue s pval [1] []) `named` "closv_res"
-        mkRes val (Just s')
+      _ -> do mk <- asks mkIntRes; call mk [(val, [])]
   Ctor name fs -> do
     clos <- nsrThunk l `named` "ctor"
     -- TODO just make the closure struct w/o allocating-then-loading
@@ -274,18 +250,44 @@ compile p args@(Args stk argc change) l = case l of
           load fieldp 0 `named` fromString s
         compile p args (instantiateVars fields b))
 
+driverTerm :: Lam Name
+Right driverTerm = parseLam . unlines $ [
+  "case main of",
+  "  Left i -> print i",
+  "  Right p ->",
+  "    let input x = (let c = (let c = getchar in c)",
+  "                   in if c <= -1 then Nil []",
+  "                      else Cons [c, input 0])",
+  "        driver o = case o of",
+  "          Nil -> 0",
+  "          Cons c cs -> (\\x -> driver cs) $! putchar c",
+  "    in driver (p (input 0))"]
+
+driver :: Lam Operand -> ModB Operand
+driver main = do
+  env <- ask
+  mkProc $ \proc cur stk argc -> do
+    let alloc0 proc = call (allocClosure env) [(lit64 0, []), (proc, [])]
+    [print, getchar, putchar] <- mapM alloc0
+      [printProc env, gcProc env, pcProc env]
+    let impl "main" = main
+        impl "print" = return print
+        impl "getchar" = return getchar
+        impl "putchar" = return putchar
+        implTerm = driverTerm >>= impl . getName
+    compile Res (Args stk argc 0) implTerm
+
 compileMain :: Lam Operand -> ModuleBuilder ()
 compileMain l = do
   env <- preamble
-  let body proc cur stk argc = compile Res (Args stk argc 0) l
-  outer <- evalStateT (runReaderT (mkProc body) env) 0
+  outer <- evalStateT (runReaderT (driver l) env) 0
   let calloc' = calloc env
   void . function "main" [] i32 . const $ do
     let allocation = [(lit64 3000, []), (lit64 8, [])]
     stkMem <- call calloc' allocation `named` "stack_mem"
     stk <- bitcast stkMem closA `named` "stack"
-    res <- call outer [(undef closP, []), (stk, []), (lit 1, [])] `named` "res"
-    resInt res `named` "res_int" >>= ret
+    call outer [(undef closP, []), (stk, []), (lit 1, [])]
+    ret (lit 0)
 
 serialize :: Module -> IO ByteString
 serialize mod = withContext $ \ctx ->

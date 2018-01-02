@@ -1,2 +1,2 @@
 let sumtorial n acc = if n == 0 then acc else sumtorial (n - 1) $! acc + n
-in sumtorial 10000000 0
+in Left [sumtorial 10000000 0]

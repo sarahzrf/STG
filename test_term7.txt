@@ -1,4 +1,4 @@
 let pow2 n =
       if n == 0 then 1
       else let pre = pow2 (n - 1) in pre + pre
-in pow2 100
+in Left [pow2 100]
