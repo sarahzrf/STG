@@ -17,4 +17,5 @@ let reverse_ acc l = case l of
         Nil -> acc
         Cons x xs -> (length_ $! acc + 1) xs
     length = length_ 0
-in Right [\i -> show (length i)]
+    snoc l x = case l of Nil -> [x]; Cons x' xs -> Cons [x', snoc xs x]
+in Right [\i -> snoc (show (length i)) '\n']

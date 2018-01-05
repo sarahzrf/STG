@@ -9,6 +9,7 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Data.ByteString (ByteString)
 import Data.List
+import qualified Data.Map as M
 import Data.String
 import Lam
 import LLVM.AST hiding (function, Name, Add, Sub, Mul)
@@ -25,7 +26,9 @@ import Preamble
 -- looks like the place we'll need fresh names is in the monad that
 -- DOESN'T supply them...
 type ModB = ReaderT Env (StateT Int ModuleBuilder)
-type FunB = IRBuilderT ModB
+-- The map associates thunk variables to variables containing the result of
+-- forcing them, to avoid duplicating thunk forces.
+type FunB = StateT (M.Map Operand Operand) (IRBuilderT ModB)
 
 -- builder API doesn't support indicating tail calls :(
 call' ::
@@ -106,9 +109,14 @@ mkProc body = do
                 (closA, ParameterName "stack"),
                 (i32, ParameterName "arg_count")]
       proc = ConstantOperand $ K.GlobalReference funTy funName
-      body' [cur, stk, argc] = body proc cur stk argc `named` "tmp"
+      body' [cur, stk, argc] =
+        evalStateT (body proc cur stk argc `named` "tmp") mempty
   function funName params resTy body'
   return proc
+
+mkProc' ::
+  (Operand -> Operand -> Operand -> Operand -> FunB ()) -> FunB Operand
+mkProc' = lift . lift . mkProc
 
 closureProc :: Eq a => Lam a -> FunB (Operand, [a])
 closureProc l = do
@@ -117,7 +125,7 @@ closureProc l = do
         Nothing -> (length seen, seen ++ [v])
         Just i  -> (i, seen)
 
-  proc <- lift . mkProc $ \proc cur stk argc -> do
+  proc <- mkProc' $ \proc cur stk argc -> do
     fields <- case free of
       [] -> return []
       _ -> do
@@ -150,7 +158,7 @@ thunk :: Lam (Var () Operand) -> FunB Operand
 thunk (Var (B ())) = return (undef closP)
 thunk (Var (F clos)) = return clos
 thunk (Ctor name fs) = do
-  proc <- lift . mkProc $ \proc cur stk argc -> do
+  proc <- mkProc' $ \proc cur stk argc -> do
     cur' <- load cur 0 `named` "cur_closv"
     mkRes (lit (hashCode name)) (Just cur') >>= ret
   let free self (B ()) = F self
@@ -173,13 +181,24 @@ scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) 0)
 compile :: Pos r -> Args -> Lam Operand -> FunB r
 compile p args@(Args stk argc change) l = case l of
   Var clos -> do
-    enter <- closEnter clos `named` "enter"
-    proc <- load enter 0 `named` "proc"
-    argc' <- case p of
-      Res -> add argc (lit change) `named` "arg_count"
-      _ -> return (lit change)
-    let tck = case p of Res -> Just MustTail; _ -> Nothing
-    result p $ call' proc [clos, stk, argc'] tck
+    saved <- gets (M.lookup clos)
+    result p $ case (p, change, saved) of
+      -- in Scrut or Force, we will never even end up reaching a
+      -- variable with change < 0 in a well-formed program, so matching
+      -- 0 is enough
+      (Scrut, 0, Just res) -> return res
+      (Force, 0, Just res) -> return res
+      _ -> do
+        enter <- closEnter clos `named` "enter"
+        proc <- load enter 0 `named` "proc"
+        case p of
+          Res -> do
+            argc' <- add argc (lit change) `named` "arg_count"
+            call' proc [clos, stk, argc'] (Just MustTail)
+          _ -> do
+            res <- call' proc [clos, stk, lit change] Nothing
+            when (change == 0) $ modify' (M.insert clos res)
+            return res
   Abs (Name s) b -> do
     let doApply = do
           (arg, args') <- pop args `named` fromString s
@@ -192,7 +211,6 @@ compile p args@(Args stk argc change) l = case l of
         clos <- nsrThunk l `named` "pap"
         closv <- load clos 0 `named` "closv_new"
         result p $ mkRes (undef i32) (Just closv))]
--- result p (nsrThunk l))]
     else doApply
   App f x -> do
     clos <- nsrThunk x `named` "arg"
@@ -216,7 +234,7 @@ compile p args@(Args stk argc change) l = case l of
             body proc = do
               clos' <- emitInstr closTy (insert proc)
               mkRes (lit i) (Just clos')
-        proc <- lift . mkProc $ \proc _ _ _ -> body proc >>= ret
+        proc <- mkProc' $ \proc _ _ _ -> body proc >>= ret
         body proc
   Op op x y -> do
     x' <- (scrutinize args x >>= resInt) `named` "lhs"
