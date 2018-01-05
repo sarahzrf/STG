@@ -1,0 +1,21 @@
+let para c n l = case l of
+      Nil -> n
+      Cons x xs -> c x xs (para c n xs)
+    breaki char =
+      let c x xs r =
+            if x == char then Pair [[x], xs] else
+            case r of Pair s0 s1 -> Pair [Cons [x, s0], s1]
+      in para c (Pair [[], []])
+    spliti char s = case breaki char s of
+      Pair i is ->
+        case i of
+          Nil -> []
+          Cons x xs -> Cons [i, spliti char is]
+    reverse_ acc l = case l of
+      Nil -> acc
+      Cons x xs -> reverse_ (Cons [x, acc]) xs
+    reverse = reverse_ []
+    app a b = para (\x xs r -> Cons [x, r]) b a
+    concat = para (\x xs r -> app x r) []
+    tac i = concat (reverse (spliti '\n' i))
+in Right [tac]
