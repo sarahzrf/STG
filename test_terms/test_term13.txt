@@ -6,6 +6,6 @@ let and a b = if a then b else False []
       if and ('A' <= c) (c <= 'Z') then doRot 'A' c else
       if and ('a' <= c) (c <= 'z') then doRot 'a' c else
       c
-    map f l = case l of Nil -> Nil []; Cons x xs -> Cons [f x, map f xs]
+    map f l = case l of Nil -> []; Cons x xs -> Cons [f x, map f xs]
     rot13 = map rot13C
 in Right [rot13]

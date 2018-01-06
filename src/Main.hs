@@ -1,4 +1,4 @@
-module Test where
+module Main where
 
 import Bound
 import Control.Monad.State
@@ -10,11 +10,9 @@ import System.Environment
 generate :: String -> IO BS.ByteString
 generate code =
   let l = either error id (parseLam code)
-      Just l' = closed l
+      l' = maybe (error "term not closed") id (closed l)
   in compileToLL l'
 
 main :: IO ()
-main = do
-  a <- getArgs
-  getContents >>= generate >>= BS.writeFile (a !! 0)
+main = getContents >>= generate >>= BS.putStr
 

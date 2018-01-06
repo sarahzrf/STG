@@ -1,10 +1,10 @@
 let tail l = case l of Cons x xs -> xs
     zipWith f xs ys =
       case xs of
-        Nil -> Nil []
+        Nil -> []
         Cons x xs' ->
           case ys of
-            Nil -> Nil []
+            Nil -> []
             Cons y ys' -> Cons [f x y, zipWith f xs' ys']
     fibs = Cons [1, Cons [1,
         zipWith (\x y -> x + y) fibs (tail fibs)
