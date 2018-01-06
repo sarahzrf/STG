@@ -64,7 +64,9 @@ switchPos p x branches = do
   switch x defaultLabel . flip map labelled $ \((k, _), l) -> (k, l)
   phis <- forM labelled $ \((_, body), label) -> do
     emitBlockStart label
+    old <- get
     r <- body
+    put old
     () <- case p of Res -> return (); _ -> br resLabel
     -- this is kinda hacky...
     let l IRBuilderState {builderBlock =

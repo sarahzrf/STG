@@ -1,0 +1,1 @@
+Left [let x = 3 in (case Foo [] of Bar -> x; Foo -> 6) + x]
