@@ -3,17 +3,33 @@ module Preamble where
 
 import Data.Functor.Identity
 import LLVM.AST hiding (function)
+import qualified LLVM.AST as AST
+import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Constant as K
 import qualified LLVM.AST.Global as G
 import LLVM.AST.Type
 import LLVM.IRBuilder
 
-lit, lit64 :: Integral a => a -> Operand
-lit = runIdentity . int32 . toInteger
+lit8, lit32, lit64 :: Integral a => a -> Operand
+lit8 = ConstantOperand . K.Int 8 . toInteger
+lit32 = runIdentity . int32 . toInteger
 lit64 = runIdentity . int64 . toInteger
 
 undef :: Type -> Operand
 undef = ConstantOperand . K.Undef
+
+-- builder API doesn't support indicating tail calls :(
+call' ::
+  MonadIRBuilder m =>
+  Operand -> [Operand] -> Maybe TailCallKind -> m Operand
+call' proc args tck = emitInstr resTy Call {
+  tailCallKind = tck,
+  callingConvention = CC.C,
+  returnAttributes = [],
+  AST.function = Right proc,
+  arguments = zip args (repeat []),
+  functionAttributes = [],
+  metadata = []}
 
 data Args =
   Args {
@@ -24,20 +40,20 @@ data Args =
 
 push :: MonadIRBuilder m => Args -> Operand -> m Args
 push (Args stk argc change) x = do
-  stk' <- gep stk [lit 1] `named` "stack"
+  stk' <- gep stk [lit32 1] `named` "stack"
   store stk' 0 x
   return (Args stk' argc (change + 1))
 
 pop :: MonadIRBuilder m => Args -> m (Operand, Args)
 pop (Args stk argc change) = do
   x <- load stk 0
-  store stk 0 (undef closP)
-  stk' <- gep stk [lit (-1)] `named` "stack"
+  store stk 0 (undef objP)
+  stk' <- gep stk [lit32 (-1)] `named` "stack"
   return (x, Args stk' argc (change - 1))
 
 data Env =
   Env {
-    allocClosure, mkIntRes, calloc,
+    allocObj, indirProc, mkIntRes, calloc,
     printProc, gcProc, pcProc :: Operand} deriving (Show)
 
 -- this compensates for a bug in llvm-hs{,-pure}
@@ -50,27 +66,29 @@ localTy :: Type -> Operand -> Operand
 localTy ty (LocalReference _ name) = LocalReference ty name
 localTy _ o = o
 
-closTyName, resTyName :: Name
-closTy, closP, closA, resTy :: Type
-closTyName = "closure"
+objTyName, resTyName :: Name
+objTy, resTy, objP, objA :: Type
+objTyName = "obj"
 resTyName = "result"
-closTy = NamedTypeReference closTyName
-closP = ptr closTy
-closA = ptr closP
+objTy = NamedTypeReference objTyName
 resTy = NamedTypeReference resTyName
+objP = ptr objTy
+objA = ptr objP
 
-funTy, closDef, resDef :: Type
+funTy, objDef, resDef :: Type
 funTy = ptr
   FunctionType {
     resultType = resTy,
-    argumentTypes = [closP, closA, i32],
+    argumentTypes = [objP, objA, i8],
     isVarArg = False}
-closDef = StructureType {
+objDef = StructureType {
   isPacked = False,
-  elementTypes = [funTy, closA]}
+  -- For closures, the i64 is the field count; for ints, the value;
+  -- for indirections, the target.
+  elementTypes = [funTy, i64, ArrayType 0 objP]}
 resDef = StructureType {
   isPacked = False,
-  elementTypes = [i32, closTy]}
+  elementTypes = [i64, objP]}
 
 mkRes :: MonadIRBuilder m => Operand -> Maybe Operand -> m Operand
 mkRes i c = flip named "res" $ do
@@ -79,82 +97,94 @@ mkRes i c = flip named "res" $ do
   maybe return (insert 1) c s
 
 -- these compensate for a bug in llvm-hs{,-pure}
-closEnter, closFieldsp :: MonadIRBuilder m => Operand -> m Operand
-closEnter clos = localTy (ptr funTy) <$> gep clos [lit 0, lit 0]
-closFieldsp clos = localTy (ptr closA) <$> gep clos [lit 0, lit 1]
+objEnter, objVal :: MonadIRBuilder m => Operand -> m Operand
+objEnter obj = localTy (ptr funTy) <$> gep obj [lit32 0, lit32 0]
+objVal obj = localTy (ptr i64) <$> gep obj [lit32 0, lit32 1]
 
-resInt, resClosv :: MonadIRBuilder m => Operand -> m Operand
-resInt res = emitInstr i32 (ExtractValue res [0] [])
-resClosv res = emitInstr closTy (ExtractValue res [1] [])
+closFieldp :: MonadIRBuilder m => Operand -> Int -> m Operand
+closFieldp clos i = localTy objP <$> gep clos [lit32 0, lit32 2, lit32 i]
+
+resInt, resObj :: MonadIRBuilder m => Operand -> m Operand
+resInt res = emitInstr i64 (ExtractValue res [0] [])
+resObj res = emitInstr objP (ExtractValue res [1] [])
 
 preamble :: ModuleBuilder Env
 preamble = do
-  typedef closTyName (Just closDef)
+  typedef objTyName (Just objDef)
   typedef resTyName (Just resDef)
   calloc <- repairGlobal <$> extern "calloc" [i64, i64] (ptr i8)
-  allocClosure <- fmap repairGlobal . function "alloc_closure"
-    [(i64, ParameterName "field_count"), (funTy, ParameterName "proc")]
-    closP $ \[fc, proc] -> do
-    fsMem <- call calloc [(fc, []), (lit64 8, [])] `named` "fields_mem"
-    fs <- bitcast fsMem closA `named` "fields"
-    closMem <- call calloc [(lit64 1, []), (lit64 16, [])] `named` "clos_mem"
-    clos <- bitcast closMem closP `named` "clos"
-    enter <- gep clos [lit 0, lit 0] `named` "enter"
+  allocObj <- fmap repairGlobal . function "alloc_obj"
+    [(funTy, ParameterName "proc"),
+     (i64, ParameterName "val"),
+     (i64, ParameterName "field_count")]
+    objP $ \[proc, val, fc] -> do
+    words <- add fc (lit64 2) `named` "words"
+    objMem <- call calloc [(words, []), (lit64 8, [])] `named` "obj_mem"
+    obj <- bitcast objMem objP `named` "obj"
+    enter <- objEnter obj `named` "enter"
     store enter 0 proc
-    fsp <- gep clos [lit 0, lit 1] `named` "fieldsp"
-    store fsp 0 fs
-    ret clos
-  let procParams = [(closP, ParameterName "cur_clos"),
-                    (closA, ParameterName "stack"),
-                    (i32, ParameterName "arg_count")]
+    valp <- objVal obj `named` "valp"
+    store valp 0 val
+    ret obj
+  let procParams = [(objP, ParameterName "cur_obj"),
+                    (objA, ParameterName "stack"),
+                    (i8, ParameterName "arg_count")]
   iproc <- fmap repairGlobal . function "iproc"
     procParams resTy $ \[cur, stk, argc] -> do
-    cur' <- load cur 0 `named` "cur_clos_struct"
-    fs <- emitInstr closA (ExtractValue cur' [1] []) `named` "fieldsp"
-    val <- ptrtoint fs i32 `named` "ival"
-    mkRes val (Just cur') >>= ret
+    valp <- objVal cur `named` "valp"
+    val <- load valp 0 `named` "val"
+    mkRes val (Just cur) >>= ret
+  indirProc <- fmap repairGlobal . function "indirection"
+    procParams resTy $ \[cur, stk, argc] -> do
+    valp <- objVal cur `named` "valp"
+    targeti <- load valp 0 `named` "targeti"
+    target <- inttoptr targeti objP `named` "target"
+    enter <- objEnter target `named` "enter"
+    proc <- load enter 0 `named` "proc"
+    call' proc [target, stk, argc] (Just MustTail) `named` "res" >>= ret
   mkIntRes <- fmap repairGlobal . function "mk_int_res"
-    [(i32, ParameterName "i")] resTy $ \[i] -> do
-    pval <- inttoptr i closA `named` "pval"
-    s <- emitInstr closTy
-      (InsertValue (undef closTy) iproc [0] []) `named` "closv_res"
-    s' <- emitInstr closTy (InsertValue s pval [1] []) `named` "closv_res"
-    mkRes i (Just s') `named` "res" >>= ret
-  printf <- repairGlobal <$> extern "printf" [ptr i8, i32] i32
+    [(i64, ParameterName "i")] resTy $ \[i] -> do
+    obj <- call allocObj [(iproc, []), (i, []), (lit64 0, [])] `named` "obj"
+    mkRes i (Just obj) >>= ret
+  printf <- repairGlobal <$> extern "printf" [ptr i8, i64] i32
   getchar <- repairGlobal <$> extern "getchar" [] i32
   putchar <- repairGlobal <$> extern "putchar" [i32] i32
   emitDefn $ GlobalDefinition globalVariableDefaults {
     G.name = "fmt",
-    G.type' = ArrayType 4 i8,
+    G.type' = ArrayType 5 i8,
     G.initializer =
-      let i8s = map (K.Int 8 . toInteger . fromEnum) "%d\n\0"
+      let i8s = map (K.Int 8 . toInteger . fromEnum) "%ld\n\0"
       in Just (K.Array i8 i8s)}
-  let fmt = ConstantOperand (K.GlobalReference (ptr (ArrayType 4 i8)) "fmt")
+  let fmt = ConstantOperand (K.GetElementPtr True
+        (K.GlobalReference (ptr (ArrayType 5 i8)) "fmt")
+        [K.Int 32 0, K.Int 32 0])
   printProc <- fmap repairGlobal . function "print_proc"
     procParams resTy $ \[cur, stk, argc] -> do
-    (clos, _) <- pop (Args stk argc 0) `named` "arg"
-    enter <- closEnter clos `named` "enter"
+    (obj, _) <- pop (Args stk argc 0) `named` "arg"
+    enter <- objEnter obj `named` "enter"
     proc <- load enter 0 `named` "proc"
-    res <- call proc [(clos, []), (stk, []), (argc, [])] `named` "res"
-    n <- resInt res
-    fmt' <- gep fmt [lit 0, lit 0] `named` "fmt"
-    call printf [(fmt', []), (n, [])]
+    res <- call proc [(obj, []), (stk, []), (argc, [])] `named` "res"
+    n <- resInt res `named` "n"
+    call printf [(fmt, []), (n, [])]
     ret (undef resTy)
   gcProc <- fmap repairGlobal . function "getchar_proc"
     procParams resTy $ \[cur, stk, argc] -> do
     c <- call getchar [] `named` "c"
-    call mkIntRes [(c, [])] `named` "res" >>= ret
+    n <- sext c i64 `named` "n"
+    call mkIntRes [(n, [])] >>= ret
   pcProc <- fmap repairGlobal . function "putchar_proc"
     procParams resTy $ \[cur, stk, argc] -> do
-    (clos, _) <- pop (Args stk argc 0) `named` "arg"
-    enter <- closEnter clos `named` "enter"
+    (obj, _) <- pop (Args stk argc 0) `named` "arg"
+    enter <- objEnter obj `named` "enter"
     proc <- load enter 0 `named` "proc"
-    res <- call proc [(clos, []), (stk, []), (argc, [])] `named` "res"
-    n <- resInt res
-    call putchar [(n, [])]
+    res <- call proc [(obj, []), (stk, []), (argc, [])] `named` "res"
+    n <- resInt res `named` "n"
+    c <- trunc n i32 `named` "c"
+    call putchar [(c, [])]
     ret (undef resTy)
   return Env {
-    allocClosure = allocClosure,
+    allocObj = allocObj,
+    indirProc = indirProc,
     mkIntRes = mkIntRes,
     calloc = calloc,
     printProc = printProc,

@@ -14,7 +14,6 @@ import Data.String
 import Lam
 import LLVM.AST hiding (function, Name, Add, Sub, Mul)
 import qualified LLVM.AST as AST
-import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Constant as K
 import qualified LLVM.AST.IntegerPredicate as IP
 import LLVM.AST.Type hiding (void)
@@ -29,19 +28,6 @@ type ModB = ReaderT Env (StateT Int ModuleBuilder)
 -- The map associates thunk variables to variables containing the result of
 -- forcing them, to avoid duplicating thunk forces.
 type FunB = StateT (M.Map Operand Operand) (IRBuilderT ModB)
-
--- builder API doesn't support indicating tail calls :(
-call' ::
-  MonadIRBuilder m =>
-  Operand -> [Operand] -> Maybe TailCallKind -> m Operand
-call' proc args tck = emitInstr resTy Call {
-  tailCallKind = tck,
-  callingConvention = CC.C,
-  returnAttributes = [],
-  AST.function = Right proc,
-  arguments = zip args (repeat []),
-  functionAttributes = [],
-  metadata = []}
 
 data Pos r where
   Res :: Pos ()
@@ -88,16 +74,14 @@ switchPos p x branches = do
 -- that a field of the closure may depend on the closure itself
 mkClosure :: Operand -> [Operand -> FunB Operand] -> FunB Operand
 mkClosure proc fieldAs = do
-  alloc <- asks allocClosure
-  clos <- call alloc [(lit64 (length fieldAs), []), (proc, [])]
+  alloc <- asks allocObj
+  let fc = lit64 (length fieldAs)
+  clos <- call alloc [(proc, []), (fc, []), (fc, [])]
   fields <- mapM ($ clos) fieldAs
 
-  when (not (null fields)) $ do
-    fsp <- closFieldsp clos `named` "fieldsp_new"
-    fs <- load fsp 0 `named` "fields_new"
-    forM_ (zip fields [0..]) $ \(fr, i) -> do
-      field <- gep fs [lit i] `named` "fieldp_new"
-      store field 0 fr
+  forM_ (zip fields [0..]) $ \(fr, i) -> do
+    fieldp <- closFieldp clos i `named` "fieldp_new"
+    store fieldp 0 fr
 
   return clos
 
@@ -107,9 +91,9 @@ mkProc body = do
   freshNum <- get
   put (freshNum + 1)
   let funName = mkName ("proc." ++ show freshNum)
-      params = [(closP, ParameterName "cur_clos"),
-                (closA, ParameterName "stack"),
-                (i32, ParameterName "arg_count")]
+      params = [(objP, ParameterName "cur_clos"),
+                (objA, ParameterName "stack"),
+                (i8, ParameterName "arg_count")]
       proc = ConstantOperand $ K.GlobalReference funTy funName
       body' [cur, stk, argc] =
         evalStateT (body proc cur stk argc `named` "tmp") mempty
@@ -131,10 +115,8 @@ closureProc l = do
     fields <- case free of
       [] -> return []
       _ -> do
-        fsp <- closFieldsp cur `named` "fieldsp_cur"
-        fs <- load fsp 0 `named` "fields_cur"
         forM [0..length free - 1] $ \i -> do
-          field <- gep fs [lit i] `named` "closedp"
+          field <- closFieldp cur i `named` "closedp"
           load field 0 `named` "closed"
     let l' = (fields !!) <$> li
     case l' of
@@ -142,14 +124,17 @@ closureProc l = do
         (arg, args') <- pop (Args stk argc 0) `named` fromString s
         compile Res args' (instantiate1 (Var arg) b)
       _ -> do
-        res <- compile Force (Args stk (lit 0) 0) l' `named` "res"
-        closv <- resClosv res `named` "closv"
-        store cur 0 closv
-        haveArg <- icmp IP.UGT argc (lit 0) `named` "have_arg"
+        res <- compile Force (Args stk (lit8 0) 0) l' `named` "res"
+        enter <- objEnter cur `named` "enter_cur"
+        asks indirProc >>= store enter 0
+        target <- resObj res `named` "target"
+        targeti <- ptrtoint target i64 `named` "targeti"
+        valp <- objVal cur `named` "valp"
+        store valp 0 targeti
+        haveArg <- icmp IP.UGT argc (lit8 0) `named` "have_arg"
         switchPos Res haveArg [(K.Int 1 0, ret res),
-                               (K.Int 1 1, do
-          proc <- emitInstr funTy (ExtractValue closv [0] []) `named` "proc"
-          call' proc [cur, stk, argc] (Just MustTail) `named` "res" >>= ret)]
+                               (K.Int 1 1,
+                                compile Res (Args stk argc 0) (Var target))]
 
   return (proc, free)
 
@@ -157,12 +142,11 @@ closureProc l = do
 -- itself. "let x = x in ..." will have undefined behavior if x is forced in
 -- "...".
 thunk :: Lam (Var () Operand) -> FunB Operand
-thunk (Var (B ())) = return (undef closP)
-thunk (Var (F clos)) = return clos
+thunk (Var (B ())) = return (undef objP)
+thunk (Var (F obj)) = return obj
 thunk (Ctor name fs) = do
-  proc <- mkProc' $ \proc cur stk argc -> do
-    cur' <- load cur 0 `named` "cur_closv"
-    mkRes (lit (hashCode name)) (Just cur') >>= ret
+  proc <- mkProc' $ \proc cur stk argc ->
+    mkRes (lit64 (hashCode name)) (Just cur) >>= ret
   let free self (B ()) = F self
       free self (F o)  = F o
       field f self = thunk (free self <$> f) `named` "field_new"
@@ -178,12 +162,12 @@ nsrThunk :: Lam Operand -> FunB Operand
 nsrThunk = thunk . fmap F
 
 scrutinize :: Args -> Lam Operand -> FunB Operand
-scrutinize (Args stk _ _) = compile Scrut (Args stk (lit 0) 0)
+scrutinize (Args stk _ _) = compile Scrut (Args stk (lit8 0) 0)
 
 compile :: Pos r -> Args -> Lam Operand -> FunB r
 compile p args@(Args stk argc change) l = case l of
-  Var clos -> do
-    saved <- gets (M.lookup clos)
+  Var obj -> do
+    saved <- gets (M.lookup obj)
     result p $ case (p, change, saved) of
       -- in Scrut or Force, we will never even end up reaching a
       -- variable with change < 0 in a well-formed program, so matching
@@ -191,82 +175,72 @@ compile p args@(Args stk argc change) l = case l of
       (Scrut, 0, Just res) -> return res
       (Force, 0, Just res) -> return res
       _ -> do
-        enter <- closEnter clos `named` "enter"
+        enter <- objEnter obj `named` "enter"
         proc <- load enter 0 `named` "proc"
         case p of
           Res -> do
-            argc' <- add argc (lit change) `named` "arg_count"
-            call' proc [clos, stk, argc'] (Just MustTail)
+            argc' <- add argc (lit8 change) `named` "arg_count"
+            call' proc [obj, stk, argc'] (Just MustTail)
           _ -> do
-            res <- call' proc [clos, stk, lit change] Nothing
-            when (change == 0) $ modify' (M.insert clos res)
+            res <- call' proc [obj, stk, lit8 change] Nothing
+            when (change == 0) $ modify' (M.insert obj res)
             return res
   Abs (Name s) b -> do
     let doApply = do
           (arg, args') <- pop args `named` fromString s
           compile p args' (instantiate1 (Var arg) b)
     if change <= 0 then do
-      haveArg <- icmp IP.UGT argc (lit (-change)) `named` "have_arg"
-      -- TODO just make the result struct w/o allocating-then-loading
+      haveArg <- icmp IP.UGT argc (lit8 (-change)) `named` "have_arg"
       switchPos p haveArg [(K.Int 1 1, doApply),
-                           (K.Int 1 0, do
-        clos <- nsrThunk l `named` "pap"
-        closv <- load clos 0 `named` "closv_new"
-        result p $ mkRes (undef i32) (Just closv))]
+                           (K.Int 1 0,
+                            nsrThunk l `named` "pap" >>=
+                            result p . mkRes (undef i64) . Just)]
     else doApply
   App f x -> do
-    clos <- nsrThunk x `named` "arg"
-    args' <- push args clos
+    obj <- nsrThunk x `named` "arg"
+    args' <- push args obj
     compile p args' f
   SApp f x -> do
-    clos <- nsrThunk x `named` "arg"
-    scrutinize args (Var clos)
-    args' <- push args clos
+    obj <- nsrThunk x `named` "arg"
+    scrutinize args (Var obj)
+    args' <- push args obj
     compile p args' f
   Let (Name s) x b -> do
-    clos <- thunk (fromScope x) `named` fromString s
-    compile p args (instantiate1 (Var clos) b)
+    obj <- thunk (fromScope x) `named` fromString s
+    compile p args (instantiate1 (Var obj) b)
   Lit i -> do
     case p of
-      Scrut -> mkRes (lit i) Nothing
+      Scrut -> mkRes (lit64 i) Nothing
       _ -> result p $ do
-        -- TODO this creates duplicate identical functions when making
-        -- a thunk from a literal
-        let insert proc = InsertValue (undef closTy) proc [0] []
-            body proc = do
-              clos' <- emitInstr closTy (insert proc)
-              mkRes (lit i) (Just clos')
-        proc <- mkProc' $ \proc _ _ _ -> body proc >>= ret
-        body proc
+        mk <- asks mkIntRes
+        call mk [(lit64 i, [])]
   Op op x y -> do
     x' <- (scrutinize args x >>= resInt) `named` "lhs"
     y' <- (scrutinize args y >>= resInt) `named` "rhs"
-    let [t, f] = map (lit . hashCode . Name) ["True", "False"]
+    let [t, f] = map (lit64 . hashCode . Name) ["True", "False"]
         sel b = select b t f
     val <- flip named "val" $ case op of
       Add -> add x' y'
       Sub -> sub x' y'
       Mul -> mul x' y'
-      Div -> emitInstr i32 $ SDiv False x' y' []
+      Div -> emitInstr i64 $ SDiv False x' y' []
       Eq  -> icmp IP.EQ x' y' >>= sel
       Leq -> icmp IP.SLE x' y' >>= sel
     result p $ case p of
       Scrut -> mkRes val Nothing
       _ -> do mk <- asks mkIntRes; call mk [(val, [])]
-  Ctor name fs -> do
-    clos <- nsrThunk l `named` "ctor"
-    -- TODO just make the closure struct w/o allocating-then-loading
-    closv <- load clos 0 `named` "closv_new"
-    result p $ mkRes (lit (hashCode name)) (Just closv)
+  Ctor name fs ->
+    nsrThunk l `named` "ctor" >>=
+    result p . mkRes (lit64 (hashCode name)) . Just
   Case x cs -> do
     x' <- scrutinize args x `named` "scrutinee"
     hash <- resInt x' `named` "hash"
-    closv <- resClosv x' `named` "closv_res"
-    fs <- emitInstr closA (ExtractValue closv [1] []) `named` "fields_res"
+    clos <- resObj x' `named` "clos_res"
+    -- fs <- emitInstr closA (ExtractValue closv [1] []) `named` "fields_res"
     switchPos p hash . flip map cs $ \(Clause name names b) ->
-      (K.Int 32 (toInteger (hashCode name)), do
+      (K.Int 64 (toInteger (hashCode name)), do
         fields <- forM (zip [0..] names) $ \(i, Name s) -> do
-          fieldp <- gep fs [lit i] `named` fromString (s ++ "p")
+          fieldp <- closFieldp clos i `named` fromString (s ++ "p")
           load fieldp 0 `named` fromString s
         compile p args (instantiateVars fields b))
 
@@ -287,7 +261,8 @@ driver :: Lam Operand -> ModB Operand
 driver main = do
   env <- ask
   mkProc $ \proc cur stk argc -> do
-    let alloc0 proc = call (allocClosure env) [(lit64 0, []), (proc, [])]
+    let alloc0 proc = call (allocObj env)
+          [(proc, []), (lit64 0, []), (lit64 0, [])]
     [print, getchar, putchar] <- mapM alloc0
       [printProc env, gcProc env, pcProc env]
     let impl "main" = main
@@ -305,9 +280,9 @@ compileMain l = do
   void . function "main" [] i32 . const $ do
     let allocation = [(lit64 3000, []), (lit64 8, [])]
     stkMem <- call calloc' allocation `named` "stack_mem"
-    stk <- bitcast stkMem closA `named` "stack"
-    call outer [(undef closP, []), (stk, []), (lit 1, [])]
-    ret (lit 0)
+    stk <- bitcast stkMem objA `named` "stack"
+    call outer [(undef objP, []), (stk, []), (lit8 1, [])]
+    ret (lit32 0)
 
 serialize :: Module -> IO ByteString
 serialize mod = withContext $ \ctx ->
