@@ -53,7 +53,7 @@ pop (Args stk argc change) = do
 
 data Env =
   Env {
-    allocObj, indirProc, mkIntRes, calloc,
+    allocObj, iproc, indirProc, mkIntRes, calloc,
     printProc, gcProc, pcProc :: Operand} deriving (Show)
 
 -- this compensates for a bug in llvm-hs{,-pure}
@@ -98,11 +98,10 @@ mkRes i c = flip named "res" $ do
 
 -- these compensate for a bug in llvm-hs{,-pure}
 objEnter, objVal :: MonadIRBuilder m => Operand -> m Operand
+objFieldp :: MonadIRBuilder m => Operand -> Int -> m Operand
 objEnter obj = localTy (ptr funTy) <$> gep obj [lit32 0, lit32 0]
 objVal obj = localTy (ptr i64) <$> gep obj [lit32 0, lit32 1]
-
-closFieldp :: MonadIRBuilder m => Operand -> Int -> m Operand
-closFieldp clos i = localTy objP <$> gep clos [lit32 0, lit32 2, lit32 i]
+objFieldp obj i = localTy objP <$> gep obj [lit32 0, lit32 2, lit32 i]
 
 resInt, resObj :: MonadIRBuilder m => Operand -> m Operand
 resInt res = emitInstr i64 (ExtractValue res [0] [])
@@ -184,6 +183,7 @@ preamble = do
     ret (undef resTy)
   return Env {
     allocObj = allocObj,
+    iproc = iproc,
     indirProc = indirProc,
     mkIntRes = mkIntRes,
     calloc = calloc,

@@ -1,6 +1,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE RecursiveDo #-}
 module LLVM2 where
 
 import Bound
@@ -43,13 +44,12 @@ result Force o = o
 -- The caller must supply an exhaustive list of possibilities or there will be
 -- undefined behavior!!!
 switchPos :: Pos r -> Operand -> [(K.Constant, FunB r)] -> FunB r
-switchPos p x branches = do
-  defaultLabel <- freshName "default"
-  resLabel <- freshName "res"
-  labelled <- forM branches $ \b -> (,) b <$> freshName "branch"
-  switch x defaultLabel . flip map labelled $ \((k, _), l) -> (k, l)
-  phis <- forM labelled $ \((_, body), label) -> do
-    emitBlockStart label
+switchPos p x branches = mdo
+  let (ks, bodies) = unzip branches
+      cases = zip ks branchLabels
+  switch x defaultLabel cases
+  (phis, branchLabels) <- fmap unzip . forM bodies $ \body -> do
+    branchLabel <- block `named` "branch"
     old <- get
     r <- body
     put old
@@ -58,104 +58,112 @@ switchPos p x branches = do
     let l IRBuilderState {builderBlock =
       Just PartialBlock {partialBlockName = name}} = name
     curLabel <- liftIRState (gets l)
-    return (r, curLabel)
-  emitBlockStart defaultLabel
+    return ((r, curLabel), branchLabel)
+  defaultLabel <- block `named` "default"
   unreachable
+  resLabel <- case p of Res -> return ""; _ -> block `named` "res"
   case p of
     Res -> return ()
-    Scrut -> do
-      emitBlockStart resLabel
-      phi phis
-    Force -> do
-      emitBlockStart resLabel
-      phi phis
+    Scrut -> phi phis
+    Force -> phi phis
 
 -- In order to support recursive definitions, we need to account for the fact
--- that a field of the closure may depend on the closure itself
-mkClosure :: Operand -> [Operand -> FunB Operand] -> FunB Operand
-mkClosure proc fieldAs = do
+-- that a field of the object may depend on the object itself.
+mkObj :: Operand -> Int -> [Operand -> FunB Operand] -> FunB Operand
+mkObj proc val fieldAs = do
   alloc <- asks allocObj
   let fc = lit64 (length fieldAs)
-  clos <- call alloc [(proc, []), (fc, []), (fc, [])]
-  fields <- mapM ($ clos) fieldAs
+  obj <- call alloc [(proc, []), (lit64 val, []), (fc, [])]
+  fields <- mapM ($ obj) fieldAs
 
   forM_ (zip fields [0..]) $ \(fr, i) -> do
-    fieldp <- closFieldp clos i `named` "fieldp_new"
+    fieldp <- objFieldp obj i `named` "fieldp_new"
     store fieldp 0 fr
 
-  return clos
+  return obj
 
-mkProc ::
-  (Operand -> Operand -> Operand -> Operand -> FunB ()) -> ModB Operand
-mkProc body = do
+type ProcImpl = Operand -> Args -> FunB ()
+
+mkProc :: ProcImpl -> ModB Operand
+mkProc impl = do
   freshNum <- get
   put (freshNum + 1)
   let funName = mkName ("proc." ++ show freshNum)
-      params = [(objP, ParameterName "cur_clos"),
+      params = [(objP, ParameterName "cur_obj"),
                 (objA, ParameterName "stack"),
                 (i8, ParameterName "arg_count")]
-      proc = ConstantOperand $ K.GlobalReference funTy funName
-      body' [cur, stk, argc] =
-        evalStateT (body proc cur stk argc `named` "tmp") mempty
-  function funName params resTy body'
-  return proc
+      impl' [cur, stk, argc] =
+        evalStateT (impl cur (Args stk argc 0) `named` "tmp") mempty
+  repairGlobal <$> function funName params resTy impl'
 
-mkProc' ::
-  (Operand -> Operand -> Operand -> Operand -> FunB ()) -> FunB Operand
+mkProc' :: ProcImpl -> FunB Operand
 mkProc' = lift . lift . mkProc
 
-closureProc :: Eq a => Lam a -> FunB (Operand, [a])
-closureProc l = do
+-- F is a normal free variable and B is a circular reference to the closure
+-- itself.
+mkClosure :: Lam (Var () Operand) -> (Lam Operand -> ProcImpl) -> FunB Operand
+mkClosure l impl = do
   let (li, free) = runState (traverse (state . replace) l) []
       replace v seen = case findIndex (==v) seen of
         Nothing -> (length seen, seen ++ [v])
         Just i  -> (i, seen)
 
-  proc <- mkProc' $ \proc cur stk argc -> do
-    fields <- case free of
-      [] -> return []
-      _ -> do
-        forM [0..length free - 1] $ \i -> do
-          field <- closFieldp cur i `named` "closedp"
-          load field 0 `named` "closed"
+  proc <- mkProc' $ \cur args -> do
+    fields <- forM [0..length free - 1] $ \i -> do
+      field <- objFieldp cur i `named` "closedp"
+      -- TODO look into saving names in Var for readable names here
+      load field 0 `named` "closed"
     let l' = (fields !!) <$> li
-    case l' of
-      Abs (Name s) b -> do
-        (arg, args') <- pop (Args stk argc 0) `named` fromString s
-        compile Res args' (instantiate1 (Var arg) b)
-      _ -> do
-        res <- compile Force (Args stk (lit8 0) 0) l' `named` "res"
-        enter <- objEnter cur `named` "enter_cur"
-        asks indirProc >>= store enter 0
-        target <- resObj res `named` "target"
-        targeti <- ptrtoint target i64 `named` "targeti"
-        valp <- objVal cur `named` "valp"
-        store valp 0 targeti
-        haveArg <- icmp IP.UGT argc (lit8 0) `named` "have_arg"
-        switchPos Res haveArg [(K.Int 1 0, ret res),
-                               (K.Int 1 1,
-                                compile Res (Args stk argc 0) (Var target))]
+    impl l' cur args
 
-  return (proc, free)
-
--- F is a normal free variable and B is a circular reference to the thunk
--- itself. "let x = x in ..." will have undefined behavior if x is forced in
--- "...".
-thunk :: Lam (Var () Operand) -> FunB Operand
-thunk (Var (B ())) = return (undef objP)
-thunk (Var (F obj)) = return obj
-thunk (Ctor name fs) = do
-  proc <- mkProc' $ \proc cur stk argc ->
-    mkRes (lit64 (hashCode name)) (Just cur) >>= ret
-  let free self (B ()) = F self
-      free self (F o)  = F o
-      field f self = thunk (free self <$> f) `named` "field_new"
-  mkClosure proc (map field fs)
-thunk l = do
-  (proc, free) <- closureProc l
   let field (B ()) self = return self
       field (F clos) self = return clos
-  mkClosure proc (map field free)
+  mkObj proc (length free) (map field free)
+
+-- "let x = x in ..." will have undefined behavior if x is forced in "...".
+thunk :: Lam (Var () Operand) -> FunB Operand
+thunk l = case l of
+  Var (B ()) -> return (undef objP)
+  Var (F obj) -> return obj
+  Abs _ _ -> mkClosure l $ \l' cur args -> do -- compile Res args l'
+    let Abs (Name s) b = l'
+    haveArg <- icmp IP.UGT (argCount args) (lit8 0) `named` "have_arg"
+    switchPos Res haveArg [(K.Int 1 1, do
+                            (arg, args') <- pop args `named` fromString s
+                            compile Res args' (instantiate1 (Var arg) b)),
+                           (K.Int 1 0,
+                            mkRes (undef i64) (Just cur) >>= ret)]
+{-
+  | Let Name (Scope () Lam a) (Scope () Lam a)
+-}
+  Lit i -> do ip <- asks iproc; mkObj ip i []
+  Op _ _ _ -> mkClosure l $ \l' cur args -> do
+    res <- compile Scrut args {argCount = lit8 0} l' `named` "res"
+    enterCur <- objEnter cur `named` "enter_cur"
+    asks iproc >>= store enterCur 0
+    valRes <- resInt res `named` "val_res"
+    valpCur <- objVal cur `named` "valp_cur"
+    store valpCur 0 valRes
+    mkRes valRes (Just cur) >>= ret
+  Ctor name fs -> do
+    proc <- mkProc' $ \cur args ->
+      mkRes (lit64 (hashCode name)) (Just cur) >>= ret
+    let free self (B ()) = F self
+        free self (F o)  = F o
+        field f self = thunk (free self <$> f) `named` "field_new"
+    mkObj proc (length fs) (map field fs)
+  l -> mkClosure l $ \l' cur args -> do
+    res <- compile Force args {argCount = lit8 0} l' `named` "res"
+    enterCur <- objEnter cur `named` "enter_cur"
+    asks indirProc >>= store enterCur 0
+    target <- resObj res `named` "target"
+    targeti <- ptrtoint target i64 `named` "targeti"
+    valp <- objVal cur `named` "valp"
+    store valp 0 targeti
+    haveArg <- icmp IP.UGT (argCount args) (lit8 0) `named` "have_arg"
+    switchPos Res haveArg [
+      (K.Int 1 0, ret res),
+      (K.Int 1 1, compile Res args (Var target))]
 
 -- nsr = no self-reference
 nsrThunk :: Lam Operand -> FunB Operand
@@ -235,12 +243,11 @@ compile p args@(Args stk argc change) l = case l of
   Case x cs -> do
     x' <- scrutinize args x `named` "scrutinee"
     hash <- resInt x' `named` "hash"
-    clos <- resObj x' `named` "clos_res"
-    -- fs <- emitInstr closA (ExtractValue closv [1] []) `named` "fields_res"
+    obj <- resObj x' `named` "obj_res"
     switchPos p hash . flip map cs $ \(Clause name names b) ->
       (K.Int 64 (toInteger (hashCode name)), do
         fields <- forM (zip [0..] names) $ \(i, Name s) -> do
-          fieldp <- closFieldp clos i `named` fromString (s ++ "p")
+          fieldp <- objFieldp obj i `named` fromString (s ++ "p")
           load fieldp 0 `named` fromString s
         compile p args (instantiateVars fields b))
 
@@ -260,7 +267,7 @@ Right driverTerm = parseLam . unlines $ [
 driver :: Lam Operand -> ModB Operand
 driver main = do
   env <- ask
-  mkProc $ \proc cur stk argc -> do
+  mkProc $ \cur args -> do
     let alloc0 proc = call (allocObj env)
           [(proc, []), (lit64 0, []), (lit64 0, [])]
     [print, getchar, putchar] <- mapM alloc0
@@ -270,7 +277,7 @@ driver main = do
         impl "getchar" = return getchar
         impl "putchar" = return putchar
         implTerm = driverTerm >>= impl . getName
-    compile Res (Args stk argc 0) implTerm
+    compile Res args implTerm
 
 compileMain :: Lam Operand -> ModuleBuilder ()
 compileMain l = do
