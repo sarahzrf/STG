@@ -1,4 +1,4 @@
-Left [(case Right [1] of
-         Left x -> (case Right [x] of Left y -> y; Right y -> 0)
-         Right x -> case Left [x] of Left y -> y; Right y -> 0)
-      + 1]
+Left ((case Right 1 of
+         Left x -> (case Right x of Left y -> y; Right y -> 0)
+         Right x -> case Left x of Left y -> y; Right y -> 0)
+      + 1)

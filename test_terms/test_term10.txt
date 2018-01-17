@@ -5,10 +5,10 @@ let tail l = case l of Cons x xs -> xs
         Cons x xs' ->
           case ys of
             Nil -> []
-            Cons y ys' -> Cons [f x y, zipWith f xs' ys']
-    fibs = Cons [1, Cons [1,
+            Cons y ys' -> f x y `Cons` zipWith f xs' ys'
+    fibs = Cons 1 (Cons 1 (
         zipWith (\x y -> x + y) fibs (tail fibs)
-      ]]
+      ))
     ix l i = case l of
       Cons x xs -> if i == 0 then x else ix xs (i - 1)
-in Left [ix fibs 100000]
+in Left (ix fibs 100000)

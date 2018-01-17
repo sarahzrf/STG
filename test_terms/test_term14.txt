@@ -1,21 +1,21 @@
 let reverse_ acc l = case l of
       Nil -> acc
-      Cons x xs -> reverse_ (Cons [x, acc]) xs
+      Cons x xs -> reverse_ (Cons x acc) xs
     reverse = reverse_ []
     digit d = '0' + d
     showPosRev n =
       if n <= 9 then [digit n] else
       let quot = n / 10
           rem = n - 10 * quot
-      in Cons [digit rem, showPosRev quot]
+      in digit rem `Cons` showPosRev quot
     show n =
       if n == 0 then "0" else
       if 0 <= n then reverse (showPosRev n) else
-      Cons ['-', reverse (showPosRev (-n))]
+      '-' `Cons` reverse (showPosRev (-n))
     length_ acc l =
       case l of
         Nil -> acc
         Cons x xs -> (length_ $! acc + 1) xs
     length = length_ 0
-    snoc l x = case l of Nil -> [x]; Cons x' xs -> Cons [x', snoc xs x]
-in Right [\i -> snoc (show (length i)) '\n']
+    snoc l x = case l of Nil -> [x]; Cons x' xs -> x' `Cons` snoc xs x
+in Right (\i -> snoc (show (length i)) '\n')

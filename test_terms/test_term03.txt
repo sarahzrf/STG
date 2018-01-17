@@ -1,1 +1,1 @@
-Left [(case Right [1] of Left x -> x; Right y -> y + 1) + 2]
+Left ((case Right 1 of Left x -> x; Right y -> y + 1) + 2)

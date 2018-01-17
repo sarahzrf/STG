@@ -1,4 +1,4 @@
-let and a b = if a then b else False []
+let and a b = if a then b else False
     doRot base x =
       let x' = (x - base) + 13
       in base + if x' <= 25 then x' else x' - 26
@@ -6,6 +6,6 @@ let and a b = if a then b else False []
       if and ('A' <= c) (c <= 'Z') then doRot 'A' c else
       if and ('a' <= c) (c <= 'z') then doRot 'a' c else
       c
-    map f l = case l of Nil -> []; Cons x xs -> Cons [f x, map f xs]
+    map f l = case l of Nil -> []; Cons x xs -> f x `Cons` map f xs
     rot13 = map rot13C
-in Right [rot13]
+in Right rot13

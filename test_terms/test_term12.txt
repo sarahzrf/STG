@@ -1,2 +1,2 @@
 let foo f b = f (if b then (\x y -> x + y) else (\x y -> x - y))
-in Left [foo (\o -> o 1 2 + o 3 4) (True [])]
+in Left (foo (\o -> o 1 2 + o 3 4) True)

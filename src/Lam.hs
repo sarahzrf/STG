@@ -134,10 +134,11 @@ hs2lam exp = case exp of
       liftA2 (Op o') (hs2lam l) (hs2lam r)
   X.InfixApp p l (X.QVarOp p' qn@(X.UnQual _ (X.Ident _ _))) r ->
     hs2lam (X.App p (X.App p (X.Var p' qn) l) r)
-  X.App _ (X.Con _ (X.UnQual _ (X.Ident _ name))) (X.List _ as) ->
-    Ctor (Name name) <$> traverse hs2lam as
+  X.InfixApp p l (X.QConOp p' qn@(X.UnQual _ (X.Ident _ _))) r ->
+    hs2lam (X.App p (X.App p (X.Con p' qn) l) r)
+  X.Con _ (X.UnQual _ (X.Ident _ name)) -> Right (Ctor (Name name) [])
   X.List _ as -> embedList <$> traverse hs2lam as
-  X.App _ f x -> liftA2 App (hs2lam f) (hs2lam x)
+  X.App _ f x -> liftA2 app (hs2lam f) (hs2lam x)
   X.NegApp _ (X.Lit _ (X.Int _ n _)) -> Right (Lit (-fromIntegral n))
   X.NegApp _ n -> Op Sub (Lit 0) <$> hs2lam n
   X.Lambda _ [] b -> hs2lam b
@@ -160,6 +161,8 @@ hs2lam exp = case exp of
   where embedList = foldr
           (\x xs -> Ctor (Name "Cons") [x, xs])
           (Ctor (Name "Nil") [])
+        app (Ctor name fs) x = Ctor name (fs ++ [x])
+        app f x' = App f x'
         clause (X.Alt _
                 (X.PApp _ (X.UnQual _ (X.Ident _ name)) ps)
                 (XUG b) Nothing)
