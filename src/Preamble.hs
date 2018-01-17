@@ -4,6 +4,7 @@ module Preamble where
 import Data.Functor.Identity
 import LLVM.AST hiding (function)
 import qualified LLVM.AST as AST
+import LLVM.AST.AddrSpace
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Constant as K
 import qualified LLVM.AST.Global as G
@@ -66,16 +67,19 @@ localTy :: Type -> Operand -> Operand
 localTy ty (LocalReference _ name) = LocalReference ty name
 localTy _ o = o
 
-objTyName, resTyName :: Name
-objTy, resTy, objP, objA :: Type
+objTyName, indirTyName, resTyName :: Name
+objTy, indirTy, resTy, objP, indirP, objA :: Type
 objTyName = "obj"
+indirTyName = "indir"
 resTyName = "result"
 objTy = NamedTypeReference objTyName
+indirTy = NamedTypeReference indirTyName
 resTy = NamedTypeReference resTyName
-objP = ptr objTy
+objP = PointerType objTy (AddrSpace 1)
+indirP = PointerType indirTy (AddrSpace 1)
 objA = ptr objP
 
-funTy, objDef, resDef :: Type
+funTy, objDef, indirDef, resDef :: Type
 funTy = ptr
   FunctionType {
     resultType = resTy,
@@ -86,6 +90,9 @@ objDef = StructureType {
   -- For closures, the i64 is the field count; for ints, the value;
   -- for indirections, the target.
   elementTypes = [funTy, i64, ArrayType 0 objP]}
+indirDef = StructureType {
+  isPacked = False,
+  elementTypes = [funTy, objP]}
 resDef = StructureType {
   isPacked = False,
   elementTypes = [i64, objP]}
@@ -110,6 +117,7 @@ resObj res = emitInstr objP (ExtractValue res [1] [])
 preamble :: ModuleBuilder Env
 preamble = do
   typedef objTyName (Just objDef)
+  typedef indirTyName (Just indirDef)
   typedef resTyName (Just resDef)
   calloc <- repairGlobal <$> extern "calloc" [i64, i64] (ptr i8)
   allocObj <- fmap repairGlobal . function "alloc_obj"
@@ -119,7 +127,8 @@ preamble = do
     objP $ \[proc, val, fc] -> do
     words <- add fc (lit64 2) `named` "words"
     objMem <- call calloc [(words, []), (lit64 8, [])] `named` "obj_mem"
-    obj <- bitcast objMem objP `named` "obj"
+    obj0 <- bitcast objMem (ptr objTy) `named` "obj0"
+    obj <- emitInstr objP $ AddrSpaceCast obj0 objP []
     enter <- objEnter obj `named` "enter"
     store enter 0 proc
     valp <- objVal obj `named` "valp"
@@ -135,9 +144,10 @@ preamble = do
     mkRes val (Just cur) >>= ret
   indirProc <- fmap repairGlobal . function "indirection"
     procParams resTy $ \[cur, stk, argc] -> do
-    valp <- objVal cur `named` "valp"
-    targeti <- load valp 0 `named` "targeti"
-    target <- inttoptr targeti objP `named` "target"
+    curI <- bitcast cur indirP `named` "cur_indir"
+    targetp <- localTy (PointerType objP (AddrSpace 1)) <$>
+      gep curI [lit32 0, lit32 1] `named` "targetp"
+    target <- load targetp 0 `named` "target"
     enter <- objEnter target `named` "enter"
     proc <- load enter 0 `named` "proc"
     call' proc [target, stk, argc] (Just MustTail) `named` "res" >>= ret

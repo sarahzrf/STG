@@ -15,6 +15,7 @@ import Data.String
 import Lam
 import LLVM.AST hiding (function, Name, Add, Sub, Mul)
 import qualified LLVM.AST as AST
+import LLVM.AST.AddrSpace
 import qualified LLVM.AST.Constant as K
 import qualified LLVM.AST.IntegerPredicate as IP
 import LLVM.AST.Type hiding (void)
@@ -156,10 +157,11 @@ thunk l = case l of
     res <- compile Force args {argCount = lit8 0} l' `named` "res"
     enterCur <- objEnter cur `named` "enter_cur"
     asks indirProc >>= store enterCur 0
+    curI <- bitcast cur indirP `named` "cur_indir"
+    targetp <- localTy (PointerType objP (AddrSpace 1)) <$>
+      gep curI [lit32 0, lit32 1] `named` "targetp"
     target <- resObj res `named` "target"
-    targeti <- ptrtoint target i64 `named` "targeti"
-    valp <- objVal cur `named` "valp"
-    store valp 0 targeti
+    store targetp 0 target
     haveArg <- icmp IP.UGT (argCount args) (lit8 0) `named` "have_arg"
     switchPos Res haveArg [
       (K.Int 1 0, ret res),
