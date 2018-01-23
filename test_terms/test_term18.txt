@@ -1,0 +1,22 @@
+let para c n l = case l of
+      Nil -> n
+      Cons x xs -> c x xs (para c n xs)
+    map f = para (\x xs r -> f x `Cons` r) Nil
+    breakEx char =
+      let c x xs r =
+            if x == char then Pair [] xs else
+            case r of Pair s0 s1 -> Pair (Cons x s0) s1
+      in para c (Pair [] [])
+    splitEx char s = case breakEx char s of
+      Pair i is ->
+        case i of
+          Nil -> []
+          Cons x xs -> i `Cons` splitEx char is
+    reverse_ acc l = case l of
+      Nil -> acc
+      Cons x xs -> reverse_ (Cons x acc) xs
+    reverse = reverse_ []
+    app a b = para (\x xs r -> Cons x r) b a
+    unlines = para (\x xs r -> app x (Cons '\n' r)) []
+    revLines i = unlines (map reverse (splitEx '\n' i))
+in Right revLines
