@@ -1,89 +1,118 @@
 #include <assert.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
+#include "memory_manager.h"
 
-typedef struct {
-    uint64_t instruction, stack_size;
-    uint8_t *stackmap_record;
-} Statepoint;
+/* TODO figure out aliasing issues */
 
-typedef struct {
-    /* heap_start <= heap < heap_end */
-    /* We'll just swap the fields when we switch heaps. */
-    void *cur_heap_start, *cur_heap_next, *cur_heap_end;
-    void *spare_heap_start, *spare_heap_next, *spare_heap_end;
-
-    /* We'll need to be able to recognize callstack gc roots that are
-     * pointers into the argstack rather than pointers into the heap.
-     * */
-    void **arg_stack_start, **arg_stack_end;
-
-    /* First-field values that indicate special handling. */
-    void *indirection, *iproc;
-
-    size_t statepoint_count;
-    Statepoint* statepoints;
-} Manager;
-
-/* temporary var for testing purposes when we want a manager in our hand - for
- * some reason gdb's variables behave bizarrely */
-Manager hand;
-
-int compare_statepoints(const void *v1, const void *v2) {
+static int compare_statepoints(const void *v1, const void *v2) {
     const Statepoint *s1 = v1, *s2 = v2;
     if (s1->instruction < s2->instruction) return -1;
     else if (s1->instruction == s2->instruction) return 0;
     else return 1;
 }
 
-#define S8  sizeof(uint8_t)
-#define S16 sizeof(uint16_t)
-#define S32 sizeof(uint32_t)
-#define S64 sizeof(uint64_t)
+#define EAT_START(src) u8 *EAT_src = src
+#define EAT_FROM(offset) size_t *EAT_offset = &offset
+#define EAT(t, name) \
+    t name; \
+    memcpy(&name, EAT_src + *EAT_offset, sizeof(t)); \
+    *EAT_offset += sizeof(t)
+#define SKIP(t) *EAT_offset += sizeof(t)
+#define ALIGN(t) \
+    if (*EAT_offset % sizeof(t) != 0) \
+    *EAT_offset += sizeof(t) - *EAT_offset % sizeof(t)
 /* https://llvm.org/docs/StackMaps.html#stackmap-format */
-void parse_stackmap(Manager *manager, uint8_t *stackmap) {
+static void parse_stackmap(Manager *manager, u8 *stackmap) {
+    EAT_START(stackmap);
+    size_t func_offset = 0;
+    EAT_FROM(func_offset);
+
+    /* header */
+    EAT(u8, ver);
+    SKIP(u8);
+    SKIP(u16);
+    assert(ver == 3);
+
+    /* counts */
+    EAT(u32, num_functions);
+    EAT(u32, num_constants);
+    EAT(u32, num_records);
     manager->statepoint_count = 0;
-    Statepoint *next_statepoint = manager->statepoints =
-        /* TODO don't hardcode this size */
-        calloc(10000, sizeof(Statepoint));
+    /* this might be more than we need, I guess */
+    manager->statepoints = calloc(num_records, sizeof(Statepoint));
 
-    assert(*stackmap == 3);
-
-    stackmap += S8 * 2 + S16; /* now at counts */
-    uint32_t num_functions = ((uint32_t*)stackmap)[0],
-             num_constants = ((uint32_t*)stackmap)[1],
-             num_records   = ((uint32_t*)stackmap)[2];
-
-    stackmap += S32 * 3; /* now at functions */
-    uint8_t *cur_record = stackmap +
+    size_t record_offset = func_offset +
         S64 * 3 * num_functions + S64 * num_constants;
 
-    for (uint32_t func_ix = 0; func_ix < num_functions; func_ix++) {
-        uint64_t *func = (uint64_t*)stackmap;
-        func += func_ix * 3;
-        uint64_t addr = func[0], stack_size = func[1], record_count = func[2];
+    for (; num_functions > 0; num_functions--) {
+        EAT(u64, addr);
+        EAT(u64, stack_size);
+        EAT(u64, func_record_count);
 
-        for (; record_count > 0; record_count--) {
+        for (; func_record_count > 0; func_record_count--) {
             assert(num_records > 0);
             num_records--;
 
-            assert(*(uint64_t*)cur_record == 2882400000);
-            uint32_t offset = *(uint32_t*)(cur_record + S64);
-            Statepoint s = {addr + offset, stack_size, cur_record};
-            manager->statepoint_count++;
-            *next_statepoint = s;
-            next_statepoint++;
+            EAT_FROM(record_offset);
 
-            cur_record += S64 + S32 + S16; /* now at num_locations */
-            uint16_t num_locations = *(uint16_t*)cur_record;
-            cur_record += S16 +
-                (S8 * 2 + S16 * 3 + S32) * (size_t)num_locations;
-            if ((size_t)cur_record % 8 != 0) cur_record += S32;
-            cur_record += S16; /* now at num_live_outs */
-            uint16_t num_live_outs = *(uint16_t*)cur_record;
-            cur_record += S16 + (S16 + S8 * 2) * (size_t)num_live_outs;
-            if ((size_t)cur_record % 8 != 0) cur_record += S32;
+            EAT(u64, patchpoint_id);
+            EAT(u32, offset);
+            SKIP(u16);
+            EAT(u16, num_locations);
+            assert(patchpoint_id == 2882400000);
+            assert(num_locations >= 3 && num_locations % 2 == 1);
+
+            u16 num_location_offsets = (num_locations - 3) / 2;
+            i32 *location_offsets = calloc(num_location_offsets, sizeof(i32));
+
+#define TYPE_SMALL_CONST 0x4
+#define TYPE_INDIRECT    0x3
+#define RSP_REGNUM       0x7
+            for (int consts = 0; consts < 3; consts++) {
+                EAT(u8, type);
+                SKIP(u8);
+                EAT(u16, size);
+                SKIP(u16);
+                SKIP(u16);
+                EAT(i32, const_val);
+                assert(type == TYPE_SMALL_CONST &&
+                        size == S64 && const_val == 0);
+            }
+
+            for (u16 lo_ix = 0; lo_ix < num_location_offsets; lo_ix++) {
+                EAT(u8, type);
+                SKIP(u8);
+                EAT(u16, size);
+                EAT(u16, regnum);
+                SKIP(u16);
+                EAT(i32, offset);
+                assert(type == TYPE_INDIRECT &&
+                        size == S64 && regnum == RSP_REGNUM);
+
+                EAT(u8, type2);
+                SKIP(u8);
+                EAT(u16, size2);
+                EAT(u16, regnum2);
+                SKIP(u16);
+                EAT(i32, offset2);
+                /* not sure I can actually rely on this in practice? */
+                assert(type2 == type && size2 == size &&
+                        regnum2 == regnum && offset2 == offset);
+
+                location_offsets[lo_ix] = offset;
+            }
+
+            Statepoint s = {addr + offset, stack_size,
+                num_location_offsets, location_offsets};
+            manager->statepoints[manager->statepoint_count] = s;
+            manager->statepoint_count++;
+
+            ALIGN(u64);
+            SKIP(u16);
+            EAT(u16, num_live_outs);
+            assert(num_live_outs == 0);
+            ALIGN(u64);
         }
     }
     assert(num_records == 0);
@@ -93,41 +122,148 @@ void parse_stackmap(Manager *manager, uint8_t *stackmap) {
             compare_statepoints);
 }
 
-Statepoint *find_statepoint(Manager *manager, uint64_t instr) {
+static Statepoint *find_statepoint(Manager *manager, u64 instr) {
     Statepoint s;
     s.instruction = instr;
     return bsearch(&s, manager->statepoints, manager->statepoint_count,
             sizeof(Statepoint), compare_statepoints);
 }
 
-void crawl_stack(Manager *manager, uint8_t *stack_return) {
-    for (;;) {
-        uint64_t return_addr = *(uint64_t*)stack_return;
-        printf("%p\n", return_addr);
-        Statepoint *prev = find_statepoint(manager, return_addr);
-        if (prev == NULL) break;
-        stack_return += prev->stack_size + 8;
-    }
-}
-
-void setup_manager(Manager *manager,
-        /* heap_size in bytes, arg_stack_size in entries */
+u64 *setup_manager(Manager *manager,
+        /* heap_size in u64s, arg_stack_size in entries */
         size_t heap_size, size_t arg_stack_size,
-        void *indirection, void *iproc,
-        void *stackmap) {
-    uint8_t *heap1 = calloc(heap_size, 1), *heap2 = calloc(heap_size, 1);
-    manager->cur_heap_start   = manager->cur_heap_next   = heap1;
-    manager->spare_heap_start = manager->spare_heap_next = heap2;
-    manager->cur_heap_end     = heap1 + heap_size;
-    manager->spare_heap_end   = heap2 + heap_size;
+        u64 indirection, u64 iproc,
+        u8 *stackmap) {
+    manager->gc.in_progress = 0;
 
-    void **arg_stack = calloc(arg_stack_size, sizeof(void*));
+    u64 *space = calloc((heap_size * 2 + arg_stack_size) * S64, 1),
+        *heap1 = space,
+        *heap2 = heap1 + heap_size,
+        *arg_stack = heap2 + heap_size;
+
+    manager->cur_heap = (Heap){heap1, heap1, heap2};
+    manager->spare_heap = (Heap){heap2, heap2, arg_stack};
+
     manager->arg_stack_start = arg_stack;
-    manager->arg_stack_end   = arg_stack + arg_stack_size;
 
     manager->indirection = indirection;
     manager->iproc = iproc;
 
     parse_stackmap(manager, stackmap);
+
+    return manager->arg_stack_start - 1;
+}
+
+static u64 *alloc(Manager *manager, size_t count);
+
+/* The second arg is actually a double pointer, but since the pointed-to
+ * pointer is stored in our giant array of u64s, we need to deref before
+ * casting to respect aliasing rules. */
+static void update(Manager *manager, u64 *ptr) {
+    u64 *target = (u64*)*ptr;
+    if (target == NULL) return;
+    while (target[0] == manager->indirection) {
+        target = (u64*)target[1];
+    }
+    u64 *new_loc = target;
+    if (!(manager->cur_heap.start <= target &&
+                target < manager->cur_heap.end)) {
+        size_t count = 2;
+        if (target[0] != manager->iproc) count += target[1];
+        new_loc = alloc(manager, count);
+        memcpy(new_loc, target, count * S64);
+
+        target[0] = manager->indirection;
+        target[1] = (u64)new_loc;
+    }
+    *ptr = (u64)new_loc;
+}
+
+/* In this case, the double pointer is so that we can advance the caller's
+ * pointer through the heap. */
+static void update_fields(Manager *manager, u64 **ptr) {
+    u64 *target = *ptr;
+    assert(target[0] != manager->indirection);
+    *ptr += 2;
+    if (target[0] == manager->iproc) return;
+    *ptr += target[1];
+    for (size_t i = 0; i < target[1]; i++) {
+        update(manager, &target[i + 2]);
+    }
+}
+
+static void collect(Manager *manager) {
+    /* fprintf(stderr, "collecting...\n"); */
+    assert(!manager->gc.in_progress);
+    manager->gc.in_progress = 1;
+
+    Heap tmp = manager->spare_heap;
+    tmp.next = tmp.start;
+    manager->spare_heap = manager->cur_heap;
+    manager->cur_heap = tmp;
+
+    u8 *return_slot = manager->gc.caller_entry;
+    for (;;) {
+        u64 return_addr;
+        memcpy(&return_addr, return_slot, S64);
+        Statepoint *prev = find_statepoint(manager, return_addr);
+        if (prev == NULL) break;
+        u8 *rsp = return_slot + 8;
+        for (u16 lo_ix = 0; lo_ix < prev->num_location_offsets; lo_ix++) {
+            /* TODO this is probably UB??? */
+            u64 *slot = (u64*)(rsp + prev->location_offsets[lo_ix]);
+            update(manager, slot);
+        }
+        return_slot = rsp + prev->stack_size;
+    }
+
+    for (u64 *arg = manager->gc.arg_stack;
+            arg >= manager->arg_stack_start; arg--) {
+        update(manager, arg);
+    }
+
+    /* now iteratively copy over all transitively referenced objects */
+    u64 *cur_obj = manager->cur_heap.start;
+    while (cur_obj < manager->cur_heap.next) {
+        update_fields(manager, &cur_obj);
+    }
+
+    size_t heap_size =
+        (manager->spare_heap.end - manager->spare_heap.start) * S64;
+    /* This is actually necessary for correctness. A closure is
+     * allocated before its children, so if allocating one of its
+     * children triggers a collection, it will have uninitialized
+     * fields. In order to be able to handle that correctly, we need to
+     * be able to assume that uninitialized fields will be NULL, so we
+     * need to wipe the old heap before it'll be suitable for future
+     * reuse. */
+    memset(manager->spare_heap.start, 0, heap_size);
+
+    manager->gc.in_progress = 0;
+}
+
+/* count in u64s */
+static u64 *alloc(Manager *manager, size_t count) {
+    u64 *new_next = manager->cur_heap.next + count;
+    if (new_next > manager->cur_heap.end) {
+        collect(manager);
+        new_next = manager->cur_heap.next + count;
+        if (new_next > manager->cur_heap.end) {
+            fprintf(stderr, "OOM!\n");
+            return NULL;
+        }
+    }
+    u64 *mem = manager->cur_heap.next;
+    manager->cur_heap.next = new_next;
+    return mem;
+}
+
+u64 *alloc_from(
+        Manager *manager,
+        u8 *caller_entry, u64 *arg_stack,
+        size_t count) {
+    manager->gc.caller_entry = caller_entry;
+    manager->gc.arg_stack = arg_stack;
+    return alloc(manager, count);
 }
 

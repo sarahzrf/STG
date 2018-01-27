@@ -4,6 +4,8 @@
 {-# LANGUAGE RecursiveDo #-}
 module LLVM2 where
 
+-- TODO fix packing and alignment issues I previously overlooked
+
 import Bound
 import Bound.Scope
 import Control.Monad.Reader
@@ -26,7 +28,7 @@ import Preamble
 
 -- looks like the place we'll need fresh names is in the monad that
 -- DOESN'T supply them...
-type ModB = ReaderT Env (StateT Int ModuleBuilder)
+type ModB = StateT Int (ReaderT Env ModuleBuilder)
 -- The map associates thunk variables to variables containing the result of
 -- forcing them, to avoid duplicating thunk forces.
 type FunB = StateT (M.Map Operand Operand) (IRBuilderT ModB)
@@ -70,11 +72,11 @@ switchPos p x branches = mdo
 
 -- In order to support recursive definitions, we need to account for the fact
 -- that a field of the object may depend on the object itself.
-mkObj :: Operand -> Int -> [Operand -> FunB Operand] -> FunB Operand
-mkObj proc val fieldAs = do
+mkObj :: Args -> Operand -> Int -> [Operand -> FunB Operand] -> FunB Operand
+mkObj (Args stk _ _) proc val fieldAs = do
   alloc <- asks allocObj
   let fc = lit64 (length fieldAs)
-  obj <- call alloc [(proc, []), (lit64 val, []), (fc, [])]
+  obj <- call alloc [(proc, []), (lit64 val, []), (fc, []), (stk, [])]
   fields <- mapM ($ obj) fieldAs
 
   forM_ (zip fields [0..]) $ \(fr, i) -> do
@@ -89,7 +91,7 @@ mkProc :: ProcImpl -> ModB Operand
 mkProc impl = do
   freshNum <- get
   put (freshNum + 1)
-  let funName = mkName ("proc." ++ show freshNum)
+  let funName = mkName ("proc_" ++ show freshNum)
       params = [(objP, ParameterName "cur_obj"),
                 (objA, ParameterName "stack"),
                 (i8, ParameterName "arg_count")]
@@ -102,8 +104,9 @@ mkProc' = lift . lift . mkProc
 
 -- F is a normal free variable and B is a circular reference to the closure
 -- itself.
-mkClosure :: Lam (Var () Operand) -> (Lam Operand -> ProcImpl) -> FunB Operand
-mkClosure l impl = do
+mkClosure :: Args ->
+  Lam (Var () Operand) -> (Lam Operand -> ProcImpl) -> FunB Operand
+mkClosure args l impl = do
   let (li, free) = runState (traverse (state . replace) l) []
       replace v seen = case findIndex (==v) seen of
         Nothing -> (length seen, seen ++ [v])
@@ -119,14 +122,14 @@ mkClosure l impl = do
 
   let field (B ()) self = return self
       field (F clos) self = return clos
-  mkObj proc (length free) (map field free)
+  mkObj args proc (length free) (map field free)
 
 -- "let x = x in ..." will have undefined behavior if x is forced in "...".
-thunk :: Lam (Var () Operand) -> FunB Operand
-thunk l = case l of
+thunk :: Args -> Lam (Var () Operand) -> FunB Operand
+thunk args l = case l of
   Var (B ()) -> return (undef objP)
   Var (F obj) -> return obj
-  Abs _ _ -> mkClosure l $ \l' cur args -> do -- compile Res args l'
+  Abs _ _ -> mkClosure args l $ \l' cur args -> do -- compile Res args l'
     let Abs (Name s) b = l'
     haveArg <- icmp IP.UGT (argCount args) (lit8 0) `named` "have_arg"
     switchPos Res haveArg [(K.Int 1 1, do
@@ -137,8 +140,8 @@ thunk l = case l of
 {-
   | Let Name (Scope () Lam a) (Scope () Lam a)
 -}
-  Lit i -> do ip <- asks iproc; mkObj ip i []
-  Op _ _ _ -> mkClosure l $ \l' cur args -> do
+  Lit i -> do ip <- asks iproc; mkObj args ip i []
+  Op _ _ _ -> mkClosure args l $ \l' cur args -> do
     res <- compile Scrut args {argCount = lit8 0} l' `named` "res"
     enterCur <- objEnter cur `named` "enter_cur"
     asks iproc >>= store enterCur 0
@@ -151,9 +154,9 @@ thunk l = case l of
       mkRes (lit64 (hashCode name)) (Just cur) >>= ret
     let free self (B ()) = F self
         free self (F o)  = F o
-        field f self = thunk (free self <$> f) `named` "field_new"
-    mkObj proc (length fs) (map field fs)
-  l -> mkClosure l $ \l' cur args -> do
+        field f self = thunk args (free self <$> f) `named` "field_new"
+    mkObj args proc (length fs) (map field fs)
+  l -> mkClosure args l $ \l' cur args -> do
     res <- compile Force args {argCount = lit8 0} l' `named` "res"
     enterCur <- objEnter cur `named` "enter_cur"
     asks indirProc >>= store enterCur 0
@@ -168,8 +171,8 @@ thunk l = case l of
       (K.Int 1 1, compile Res args (Var target))]
 
 -- nsr = no self-reference
-nsrThunk :: Lam Operand -> FunB Operand
-nsrThunk = thunk . fmap F
+nsrThunk :: Args -> Lam Operand -> FunB Operand
+nsrThunk args = thunk args . fmap F
 
 scrutinize :: Args -> Lam Operand -> FunB Operand
 scrutinize (Args stk _ _) = compile Scrut (Args stk (lit8 0) 0)
@@ -203,27 +206,27 @@ compile p args@(Args stk argc change) l = case l of
       haveArg <- icmp IP.UGT argc (lit8 (-change)) `named` "have_arg"
       switchPos p haveArg [(K.Int 1 1, doApply),
                            (K.Int 1 0,
-                            nsrThunk l `named` "pap" >>=
+                            nsrThunk args l `named` "pap" >>=
                             result p . mkRes (undef i64) . Just)]
     else doApply
   App f x -> do
-    obj <- nsrThunk x `named` "arg"
+    obj <- nsrThunk args x `named` "arg"
     args' <- push args obj
     compile p args' f
   SApp f x -> do
-    obj <- nsrThunk x `named` "arg"
+    obj <- nsrThunk args x `named` "arg"
     scrutinize args (Var obj)
     args' <- push args obj
     compile p args' f
   Let (Name s) x b -> do
-    obj <- thunk (fromScope x) `named` fromString s
+    obj <- thunk args (fromScope x) `named` fromString s
     compile p args (instantiate1 (Var obj) b)
   Lit i -> do
     case p of
       Scrut -> mkRes (lit64 i) Nothing
       _ -> result p $ do
         mk <- asks mkIntRes
-        call mk [(lit64 i, [])]
+        call mk [(lit64 i, []), (stk, [])]
   Op op x y -> do
     x' <- (scrutinize args x >>= resInt) `named` "lhs"
     y' <- (scrutinize args y >>= resInt) `named` "rhs"
@@ -238,9 +241,9 @@ compile p args@(Args stk argc change) l = case l of
       Leq -> icmp IP.SLE x' y' >>= sel
     result p $ case p of
       Scrut -> mkRes val Nothing
-      _ -> do mk <- asks mkIntRes; call mk [(val, [])]
+      _ -> do mk <- asks mkIntRes; call mk [(val, []), (stk, [])]
   Ctor name fs ->
-    nsrThunk l `named` "ctor" >>=
+    nsrThunk args l `named` "ctor" >>=
     result p . mkRes (lit64 (hashCode name)) . Just
   Case x cs -> do
     x' <- scrutinize args x `named` "scrutinee"
@@ -269,9 +272,9 @@ Right driverTerm = parseLam . unlines $ [
 driver :: Lam Operand -> ModB Operand
 driver main = do
   env <- ask
-  mkProc $ \cur args -> do
+  mkProc $ \cur args@(Args stk _ _) -> do
     let alloc0 proc = call (allocObj env)
-          [(proc, []), (lit64 0, []), (lit64 0, [])]
+          [(proc, []), (lit64 0, []), (lit64 0, []), (stk, [])]
     [print, getchar, putchar] <- mapM alloc0
       [printProc env, gcProc env, pcProc env]
     let impl "main" = main
@@ -281,22 +284,11 @@ driver main = do
         implTerm = driverTerm >>= impl . getName
     compile Res args implTerm
 
-compileMain :: Lam Operand -> ModuleBuilder ()
-compileMain l = do
-  env <- preamble
-  outer <- evalStateT (runReaderT (driver l) env) 0
-  let calloc' = calloc env
-  void . function "main" [] i32 . const $ do
-    let allocation = [(lit64 3000, []), (lit64 8, [])]
-    stkMem <- call calloc' allocation `named` "stack_mem"
-    stk <- bitcast stkMem objA `named` "stack"
-    call outer [(undef objP, []), (stk, []), (lit8 1, [])]
-    ret (lit32 0)
-
 serialize :: Module -> IO ByteString
 serialize mod = withContext $ \ctx ->
   L.withModuleFromAST ctx mod L.moduleLLVMAssembly
 
 compileToLL :: Lam Operand -> IO ByteString
-compileToLL = serialize . buildModule "main" . compileMain
+compileToLL = serialize . buildModule "main" . moduleFor . drive
+  where drive l = runReaderT (evalStateT (driver l) 0)
 

@@ -8,6 +8,7 @@ import LLVM.AST.AddrSpace
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Constant as K
 import qualified LLVM.AST.Global as G
+import qualified LLVM.AST.Linkage as L
 import LLVM.AST.Type
 import LLVM.IRBuilder
 
@@ -54,7 +55,7 @@ pop (Args stk argc change) = do
 
 data Env =
   Env {
-    allocObj, iproc, indirProc, mkIntRes, calloc,
+    allocObj, iproc, indirProc, mkIntRes,
     printProc, gcProc, pcProc :: Operand} deriving (Show)
 
 -- this compensates for a bug in llvm-hs{,-pure}
@@ -114,19 +115,26 @@ resInt, resObj :: MonadIRBuilder m => Operand -> m Operand
 resInt res = emitInstr i64 (ExtractValue res [0] [])
 resObj res = emitInstr objP (ExtractValue res [1] [])
 
-preamble :: ModuleBuilder Env
-preamble = do
+-- TODO clean up some of the mess here
+moduleFor :: (Env -> ModuleBuilder Operand) -> ModuleBuilder ()
+moduleFor k = do
   typedef objTyName (Just objDef)
   typedef indirTyName (Just indirDef)
   typedef resTyName (Just resDef)
-  calloc <- repairGlobal <$> extern "calloc" [i64, i64] (ptr i8)
+  -- TODO label this noalias or something
+  iaf <- repairGlobal <$> extern "instance_alloc_from"
+    [ptr i8, ptr i64, i64] (ptr i64)
+  aora <- repairGlobal <$> extern "llvm.addressofreturnaddress" [] (ptr i8)
   allocObj <- fmap repairGlobal . function "alloc_obj"
     [(funTy, ParameterName "proc"),
      (i64, ParameterName "val"),
-     (i64, ParameterName "field_count")]
-    objP $ \[proc, val, fc] -> do
+     (i64, ParameterName "field_count"),
+     (objA, ParameterName "stack")]
+    objP $ \[proc, val, fc, stk] -> do
     words <- add fc (lit64 2) `named` "words"
-    objMem <- call calloc [(words, []), (lit64 8, [])] `named` "obj_mem"
+    ce <- call aora [] `named` "ce"
+    stk' <- bitcast stk (ptr i64) `named` "stk_"
+    objMem <- call iaf [(ce, []), (stk', []), (words, [])] `named` "obj_mem"
     obj0 <- bitcast objMem (ptr objTy) `named` "obj0"
     obj <- emitInstr objP $ AddrSpaceCast obj0 objP []
     enter <- objEnter obj `named` "enter"
@@ -152,8 +160,10 @@ preamble = do
     proc <- load enter 0 `named` "proc"
     call' proc [target, stk, argc] (Just MustTail) `named` "res" >>= ret
   mkIntRes <- fmap repairGlobal . function "mk_int_res"
-    [(i64, ParameterName "i")] resTy $ \[i] -> do
-    obj <- call allocObj [(iproc, []), (i, []), (lit64 0, [])] `named` "obj"
+    [(i64, ParameterName "i"), (objA, ParameterName "stack")]
+    resTy $ \[i, stk] -> do
+    obj <- call allocObj
+      [(iproc, []), (i, []), (lit64 0, []), (stk, [])] `named` "obj"
     mkRes i (Just obj) >>= ret
   printf <- repairGlobal <$> extern "printf" [ptr i8, i64] i32
   getchar <- repairGlobal <$> extern "getchar" [] i32
@@ -180,7 +190,7 @@ preamble = do
     procParams resTy $ \[cur, stk, argc] -> do
     c <- call getchar [] `named` "c"
     n <- sext c i64 `named` "n"
-    call mkIntRes [(n, [])] >>= ret
+    call mkIntRes [(n, []), (stk, [])] >>= ret
   pcProc <- fmap repairGlobal . function "putchar_proc"
     procParams resTy $ \[cur, stk, argc] -> do
     (obj, _) <- pop (Args stk argc 0) `named` "arg"
@@ -191,14 +201,32 @@ preamble = do
     c <- trunc n i32 `named` "c"
     call putchar [(c, [])]
     ret (undef resTy)
-  return Env {
+  outer <- k Env {
     allocObj = allocObj,
     iproc = iproc,
     indirProc = indirProc,
     mkIntRes = mkIntRes,
-    calloc = calloc,
     printProc = printProc,
     gcProc = gcProc,
     pcProc = pcProc
   }
+  emitDefn $ GlobalDefinition globalVariableDefaults {
+    G.name = "__LLVM_StackMaps",
+    G.type' = ArrayType 0 i8,
+    G.linkage = L.External}
+  let stackmap = ConstantOperand (K.GetElementPtr True
+        (K.GlobalReference (ptr (ArrayType 0 i8)) "__LLVM_StackMaps")
+        [K.Int 32 0, K.Int 32 0])
+  ism <- repairGlobal <$> extern "instance_setup_manager"
+    [i64, i64, i64, i64, ptr i8] (ptr i64)
+  function "main" [] i32 . const $ do
+    indirProc' <- ptrtoint indirProc i64
+    iproc' <- ptrtoint iproc i64
+    let setupArgs = [(lit64 1000000, []), (lit64 3000, []),
+                     (indirProc', []), (iproc', []), (stackmap, [])]
+    stkMem <- call ism setupArgs `named` "stack_mem"
+    stk <- bitcast stkMem objA `named` "stack"
+    call outer [(undef objP, []), (stk, []), (lit8 1, [])]
+    ret (lit32 0)
+  return ()
 
