@@ -161,7 +161,7 @@ static u64 *alloc(Manager *manager, size_t count);
  * casting to respect aliasing rules. */
 static void update(Manager *manager, u64 *ptr) {
     u64 *target = (u64*)*ptr;
-    if (target == NULL) return;
+    if ((u64)target == 0) return;
     while (target[0] == manager->indirection) {
         target = (u64*)target[1];
     }
@@ -234,7 +234,7 @@ static void collect(Manager *manager) {
      * allocated before its children, so if allocating one of its
      * children triggers a collection, it will have uninitialized
      * fields. In order to be able to handle that correctly, we need to
-     * be able to assume that uninitialized fields will be NULL, so we
+     * be able to assume that uninitialized fields will be 0, so we
      * need to wipe the old heap before it'll be suitable for future
      * reuse. */
     memset(manager->spare_heap.start, 0, heap_size);
