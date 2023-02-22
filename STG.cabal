@@ -5,11 +5,11 @@ name:                STG
 version:             0.1.0.0
 synopsis:            A toy compiler based vaguely off of the STG machine
 -- description:
-homepage:            https://github.com/benzrf/STG
+homepage:            https://github.com/sarahzrf/STG
 license:             GPL-3
 license-file:        LICENSE
-author:              benzrf
-maintainer:          benzrf@benzrf.com
+author:              sarahzrf
+maintainer:          sarahzrf@protonmail.com
 -- copyright:
 -- category:
 build-type:          Simple
